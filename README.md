@@ -91,7 +91,9 @@ are still honored as a fallback.
 | ------------------- | ------------- | ------------------------------------- |
 | `CHIVE_HOST`        | `127.0.0.1`   | interface the server binds to         |
 | `CHIVE_PORT`        | `8765`        | port the server listens on            |
-| `CHIVE_STATE_DIR`   | `~/.chive`    | where queue/settings/history persist  |
+| `CHIVE_STATE_DIR`   | `~/.chive`    | where queue/settings/history/logs persist |
+| `CHIVE_DOWNLOAD_DIR`| `~/Downloads/Chive` | first-run download folder (changeable in Settings) |
+| `CHIVE_ALLOWED_HOSTS` | —           | extra hostnames to accept, comma-separated (see *Security*) |
 | `CHIVE_DEBUG`       | off           | also write raw, timestamped yt-dlp output to `<state dir>/logs` |
 
 ```sh
@@ -131,7 +133,8 @@ podcasts with the same flow. Search a show by name (via the free Apple/iTunes
 podcast directory), pick it, and its episodes load into the same grid — click
 an episode to queue it, or **Queue all** to grab the entire feed. Episodes are
 the show's RSS audio enclosures, downloaded as-is by yt-dlp's generic extractor
-into `…/<Podcast>/<Episode>.<ext>`, reusing the whole queue/progress/stats
+into `…/<Podcast>/<Episode> [<tag>].<ext>` (the tag comes from the episode's
+feed id, so same-titled episodes such as "Trailer" never collide), reusing the whole queue/progress/stats
 machinery. Already-downloaded episodes are grayed out, just like videos.
 
 > **Beyond YouTube.** This started as a YouTube channel archiver and is becoming
@@ -161,13 +164,22 @@ Each queued item becomes a `yt-dlp` subprocess with:
 - `-o '<dir>/%(uploader)s/%(title)s [%(id)s].%(ext)s'`
 
 When the `yt_dlp` module is importable, downloads run through
-`ytdlp_runner.py`, which drives yt-dlp via its Python API and emits progress
-from a `progress_hooks` callback with an explicit `flush()`. This is the only
-thing that streams progress reliably on Windows, where yt-dlp buffers its own
-stdout and the bar would otherwise jump straight to 100%. (Without the module,
-it falls back to the `yt-dlp` binary + `--progress-template`.) Progress
-percent, speed, ETA and byte counts are broadcast to the UI over Server-Sent
-Events at `/api/events`, and retained per item for the in-app log viewer.
+`chive/ytdlp_runner.py`, which drives yt-dlp via its Python API and emits
+progress from a `progress_hooks` callback with an explicit `flush()`. This is
+the only thing that streams progress reliably on Windows, where yt-dlp buffers
+its own stdout and the bar would otherwise jump straight to 100%. It also
+reports one figure for the *whole item* — a "best video + best audio" pick is
+two downloads, which would otherwise run the bar 0→100% twice. (Without the
+module, Chive falls back to the `yt-dlp` binary + `--progress-template`.)
+Progress, speed, ETA and byte counts are broadcast to the UI over Server-Sent
+Events at `/api/events`.
+
+Every item keeps a readable log (`<state dir>/item-logs/<id>.log`): the
+command, yt-dlp's status lines, a progress summary every 10%, and the outcome.
+It survives restarts; retries and resumes append below a separator.
+
+Quitting the server stops running downloads; they come back as **pending**
+and resume from their `.part` file on the next start.
 
 The server runs under **waitress** when available, which serves concurrent
 requests reliably while the SSE stream is open (the Flask dev server can drop
@@ -175,11 +187,22 @@ a request mid-download); it falls back to the dev server otherwise. A live
 connection pill, disk-space guard, and aggregate queue stats round out the
 monitoring.
 
-### Tests
-`python3 -m unittest discover -s tests` — offline unit tests (yt-dlp is
-mocked) covering the Shorts heuristic, progress parsing, scrape pagination
-and whole-channel filter/sort, command building (SponsorBlock modes,
-subtitles), source validation, and the byte helpers.
+### Security
+The bridge drives yt-dlp, writes files and can run `pip` on your machine, so
+it only obeys its own page:
+
+- **Host check** — requests must be addressed to a loopback name
+  (`127.0.0.1`, `localhost`, `::1`). This blocks *DNS rebinding*, where a
+  malicious site re-points its domain at your machine to read the API. If you
+  reach Chive by another name, add it to `CHIVE_ALLOWED_HOSTS`.
+- **JSON-only writes** — state-changing requests must be
+  `application/json` and must not carry a foreign `Origin`. Browsers can't
+  send that cross-site without a CORS preflight, which Chive never grants, so
+  other websites can't queue downloads or change settings behind your back.
+
+Binding to a non-loopback `CHIVE_HOST` (e.g. `0.0.0.0` for a NAS) accepts any
+hostname unless `CHIVE_ALLOWED_HOSTS` is set — and there is no login, so only
+do that on a network you trust.
 
 ### SponsorBlock categories
 | Key              | Meaning                       |
@@ -197,24 +220,57 @@ subtitles), source validation, and the byte helpers.
 
 ```
 .
-├── server.py             # Flask bridge
-├── requirements.txt
+├── server.py               # entry point: python server.py
+├── chive/                  # the bridge
+│   ├── config.py           #   environment, paths, constants
+│   ├── settings.py         #   persisted preferences (validated)
+│   ├── models.py           #   the queue item
+│   ├── manager.py          #   queue, workers, logs, events
+│   ├── commands.py         #   yt-dlp command building
+│   ├── progress.py         #   yt-dlp output → progress & phases
+│   ├── ytdlp.py            #   locating / invoking yt-dlp & ffmpeg
+│   ├── ytdlp_runner.py     #   flushing API wrapper (run as a subprocess)
+│   ├── youtube.py          #   scraping, search, filter & sort
+│   ├── podcasts.py         #   podcast search & RSS feeds
+│   ├── library.py          #   what's already on disk
+│   ├── api.py              #   Flask app, request guard, SSE
+│   └── util.py             #   formatting, disk, process helpers
 ├── static/
-│   ├── index.html        # SPA shell
-│   ├── style.css         # Editorial Dusk theme
-│   └── app.js            # SSE client, grid, queue
-└── downloads/            # default output (created on first run)
+│   ├── index.html          # the page
+│   ├── style.css           # Dusk / Dawn themes
+│   └── js/                 # ES modules (no build step)
+│       ├── app.js          #   state, rendering, bindings
+│       ├── queue-model.js  #   pure queue/event logic
+│       ├── format.js       #   pure formatting
+│       └── …               #   api, dom, modal, log viewer, easter eggs
+└── tests/                  # Python, JS and browser tests
 ```
+
+## Development
+
+```sh
+pip install -r requirements.txt ruff
+ruff check .                                  # lint
+python -m unittest discover -s tests          # Python: unit + integration
+npm test                                      # JS: pure modules (Node ≥ 20)
+npm install && npx playwright install chromium
+npm run test:e2e                              # browser end-to-end smoke test
+```
+
+Everything runs offline: yt-dlp is mocked or scripted for unit tests, and the
+integration and end-to-end tests download from a local HTTP server. CI runs
+all of it on Linux and Windows.
 
 ## Notes
 
 - The bridge binds to `127.0.0.1` by default. Don't expose it on a
-  public interface — it shells out to `yt-dlp` with user input.
+  public interface — see *Security*.
 - Queue, settings, and recent channels persist to
   `~/.chive/state.json` (override with `CHIVE_STATE_DIR`; a pre-existing
   `~/.ytarchive` is honored for backward compatibility).
-  Interrupted downloads come back as **pending** on next launch and
-  resume from the `.part` file when restarted.
+- Downloads default to `~/Downloads/Chive` — outside the app folder, so
+  updating or deleting the app can't take your library with it. An existing,
+  non-empty `downloads/` folder from an earlier version keeps being used.
 
 ## License
 

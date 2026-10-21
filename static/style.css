@@ -11,7 +11,6 @@
   --surface-1: #14110e;
   --surface-2: #0f0d0b;
   --surface-3: #0c0a08;
-  --amber: #d4a574;
   --sage: #93b58a;            /* muted sibling of --chive: the "done" green */
   --chive: #84c95c;           /* the herb — refined fresh green, the focal accent */
   --cream: #f5ecd9;
@@ -43,7 +42,6 @@
   --modal-bg: rgba(12, 10, 8, 0.92);
 
   /* RGB triples for composable alpha (glows, halos) — flip with the theme */
-  --amber-rgb: 212, 165, 116;
   --chive-rgb: 132, 201, 92;
   --sage-rgb: 147, 181, 138;
   --cream-rgb: 245, 236, 217;
@@ -61,7 +59,6 @@
   --surface-2: #efe6d8;
   --surface-3: #e9dfce;
   /* accents deepened so they hold contrast against cream */
-  --amber: #b07d3e;
   --sage: #6f8a54;                /* muted sibling of --chive on cream */
   --chive: #629633;               /* deepened so it holds contrast on cream */
   --cream: #211d17;               /* heading role inverts to a warm near-black */
@@ -91,7 +88,6 @@
   --disabled-bg: rgba(220, 210, 192, 0.6);
   --modal-bg: rgba(252, 248, 240, 0.98);
 
-  --amber-rgb: 176, 125, 62;
   --chive-rgb: 98, 150, 51;
   --sage-rgb: 111, 138, 84;
   --cream-rgb: 120, 95, 50;
@@ -174,21 +170,6 @@ body {
 
 /* --- typographic primitives ---------------------------------------------- */
 
-.display {
-  font-family: var(--serif);
-  font-weight: 400;
-  font-size: 4rem;
-  line-height: 0.95;
-  letter-spacing: -0.01em;
-  color: var(--cream);
-  margin: 0 0 1.25rem;
-}
-.display em { font-style: italic; color: var(--amber); font-weight: 400; }
-
-@media (max-width: 640px) {
-  .display { font-size: 3rem; }
-}
-
 .section-title {
   font-family: var(--serif);
   font-weight: 400;
@@ -198,23 +179,6 @@ body {
   margin: 0;
 }
 .section-title em { font-style: italic; color: var(--sage); font-weight: 400; }
-
-.lede {
-  color: var(--text-body);
-  max-width: 56ch;
-  margin: 0;
-  font-size: 1.0625rem;
-  line-height: 1.6;
-}
-
-.eyebrow {
-  font-family: var(--sans);
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.3em;
-  color: var(--text-mute);
-  margin: 0 0 1.75rem;
-}
 
 .marker {
   font-family: var(--serif);
@@ -257,7 +221,6 @@ body {
   justify-content: space-between;
   gap: 1rem;
 }
-.masthead-top .eyebrow { margin: 0; }
 .masthead-right { margin-top: 0.35rem; }
 
 .brand-block { min-width: 0; }
@@ -467,20 +430,6 @@ input[type="text"]:focus { border-color: var(--text-mute); }
   background: var(--disabled-bg);
   color: var(--text-decor);
   box-shadow: none;
-}
-
-.btn-secondary {
-  background: transparent;
-  color: var(--text-high);
-  border-color: var(--text-high);
-}
-.btn-secondary:hover:not(:disabled) {
-  background: var(--text-high);
-  color: var(--surface-1);
-}
-.btn-secondary:disabled {
-  border-color: var(--border);
-  color: var(--text-decor);
 }
 
 .btn-ghost {
@@ -1045,19 +994,6 @@ input[type="text"]:focus { border-color: var(--text-mute); }
   margin-left: auto;
 }
 
-/* --- advanced settings grid --------------------------------------------- */
-
-.advanced-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  margin-top: 1rem;
-}
-@media (max-width: 760px) {
-  .advanced-grid { grid-template-columns: 1fr; }
-}
-
-.concurrency-row,
 .field-row {
   display: flex;
   align-items: center;
@@ -1065,11 +1001,9 @@ input[type="text"]:focus { border-color: var(--text-mute); }
   gap: 1rem;
   margin-bottom: 1rem;
 }
+/* --- settings fields ------------------------------------------------------ */
+
 .field-label {
-  font-size: 0.875rem;
-  color: var(--text-body);
-}
-.concurrency-label {
   font-size: 0.875rem;
   color: var(--text-body);
 }
@@ -1475,3 +1409,5 @@ input[list]::-webkit-calendar-picker-indicator {
   .settings-body .config-grid { grid-template-columns: 1fr; }
 }
 .settings-body .panel { background: var(--panel-bg-faint); }
+
+.hint.is-error { color: var(--err-fg); }

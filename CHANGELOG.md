@@ -5,6 +5,40 @@ All notable changes to Chive are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+- **Request guard**: the API now only obeys its own page. Requests must be
+  addressed to a loopback host (blocks DNS rebinding), and state-changing
+  requests must be JSON without a foreign `Origin` (blocks other websites from
+  queueing downloads, changing settings or running the yt-dlp updater).
+  `CHIVE_ALLOWED_HOSTS` adds hostnames for LAN setups.
+
+### Changed
+- **Whole-item progress**: a video+audio download now reports one progress
+  figure instead of running the bar 0→100% once per stream.
+- **Default download folder** is `~/Downloads/Chive` (or `CHIVE_DOWNLOAD_DIR`),
+  outside the app folder. An existing non-empty `downloads/` keeps being used.
+- Health checks no longer spawn processes every 30 s — tool versions are
+  cached (and refreshed after an update).
+- Podcast feeds are cached, so paging and filtering a show no longer
+  re-downloads the whole feed; the scrape cache is now bounded.
+- Podcast episodes no longer carry a meaningless video-quality preset.
+- Failed yt-dlp updates explain common causes (e.g. a system-managed Python).
+- Dialogs are accessible: focus moves in, Tab stays in, Escape closes only
+  the top dialog, and focus returns to what opened it.
+- Completed rows show *how* they completed ("Skipped — already in archive").
+
+### Internal
+- `server.py` (2,400 lines) split into the `chive` package: config, settings,
+  models, manager, commands, progress, ytdlp, youtube, podcasts, library, api.
+  Settings are one validated dataclass instead of three hand-synced copies.
+- Frontend split into ES modules (`static/js/`); the quality and SponsorBlock
+  lists now come from the server instead of being duplicated in JS.
+- Removed dead code: unused stats/cancel-all paths, a pass-through helper,
+  unused CSS rules and the retired amber colour tokens.
+- Tests: 128 Python (unit, API, real-process lifecycle, offline real
+  downloads), 18 JS unit tests, and a browser end-to-end smoke test; ruff
+  lint. CI runs all of it on Linux and Windows.
+
 ### Fixed
 - **Live updates under waitress**: the event stream sent a hop-by-hop
   `Connection` header, which waitress rejects — the stream died before it

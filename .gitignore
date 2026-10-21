@@ -21,3 +21,6 @@ downloads/
 Thumbs.db
 .idea/
 .vscode/
+
+# Node test tooling
+node_modules/

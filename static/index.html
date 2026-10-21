@@ -168,7 +168,7 @@
             <option value="least_viewed">Least viewed</option>
           </select>
         </label>
-        <button type="button" class="btn btn-ghost youtube-only" id="toggle-filters">
+        <button type="button" class="btn btn-ghost youtube-only" id="toggle-filters" aria-expanded="false" aria-controls="advanced-filters">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M7 12h10M10 18h4"></path></svg>
           Filters
         </button>
@@ -272,7 +272,7 @@
 
   <!-- ===== Settings modal ===== -->
   <div class="modal-overlay" id="settings-modal" hidden>
-    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
       <div class="modal-head">
         <h3 id="settings-title">Settings</h3>
         <button type="button" class="modal-close" id="settings-close" aria-label="Close settings">
@@ -449,7 +449,7 @@
 
   <!-- ===== Log modal ===== -->
   <div class="modal-overlay" id="log-modal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="log-modal-title" tabindex="-1">
       <div class="modal-head">
         <h3 id="log-modal-title">Log</h3>
         <div class="modal-head-actions">
@@ -460,10 +460,10 @@
           </button>
         </div>
       </div>
-      <pre class="modal-log mono" id="log-modal-body"></pre>
+      <pre class="modal-log mono" id="log-modal-body" tabindex="0" aria-live="off"></pre>
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/app.js"></script>
 </body>
 </html>
