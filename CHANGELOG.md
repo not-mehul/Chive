@@ -3,6 +3,36 @@
 All notable changes to Chive are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Live updates under waitress**: the event stream sent a hop-by-hop
+  `Connection` header, which waitress rejects — the stream died before it
+  opened, so the queue never populated or updated.
+- **Log viewer**: logs are now written to disk (`<state dir>/item-logs`) and
+  survive restarts; the viewer follows a running download live; progress is
+  summarised every 10% instead of flooding the log; retries and resumes append
+  below a separator so the earlier failure stays visible.
+- **Archive skips reported as "Saved"**: `--print` silently implied `--quiet`,
+  hiding yt-dlp's status lines. Skips now show "Skipped — already in archive"
+  (or "Already on disk").
+- **Same-titled podcast episodes** ("Trailer", "Bonus") overwrote/skipped each
+  other. Files are now `<title> [<tag>].<ext>`, with the tag from the episode
+  guid; older files still count as downloaded.
+- **Downloads outliving the server**: quitting now stops running downloads;
+  they resume from their `.part` file on the next launch.
+- Queueing a whole feed sends one event instead of one per episode (the UI
+  froze and long batches could drop items); unqueueing no longer rebuilds the
+  whole queue per item.
+- Malformed `page` values returned an HTML 500; API errors are now always
+  JSON. Podcast feed URLs must be `http(s)` (no `file://`).
+- Each download leaked its stdout pipe; concurrent state writes could land out
+  of order; podcast guids with quotes broke card selection; "Download .log"
+  after a yt-dlp update saved the wrong log; subtitle settings didn't sync
+  across tabs.
+- Docs/UI text: accurate privacy note, `CHIVE_DEBUG` description, and the
+  cookies hint now points at Settings → Access & throughput.
+
 ## [1.0.0] — 2026-06-22
 
 First public release. Chive (ar·chive) is a local web app for archiving

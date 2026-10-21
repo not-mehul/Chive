@@ -8,7 +8,8 @@
 
 A local web app for archiving **YouTube channels and podcasts** — with
 SponsorBlock segments cut out automatically. Everything runs on your machine;
-the browser never speaks to YouTube directly, and there's no telemetry.
+there's no telemetry. Downloads and scraping go through the local bridge; the
+browser itself only loads thumbnails/artwork and Google Fonts.
 
 Built as a three-tier system:
 
@@ -91,7 +92,7 @@ are still honored as a fallback.
 | `CHIVE_HOST`        | `127.0.0.1`   | interface the server binds to         |
 | `CHIVE_PORT`        | `8765`        | port the server listens on            |
 | `CHIVE_STATE_DIR`   | `~/.chive`    | where queue/settings/history persist  |
-| `CHIVE_DEBUG`       | off           | set truthy for Flask debug + tracebacks |
+| `CHIVE_DEBUG`       | off           | also write raw, timestamped yt-dlp output to `<state dir>/logs` |
 
 ```sh
 CHIVE_HOST=127.0.0.1 CHIVE_PORT=8765 python3 server.py
@@ -119,7 +120,8 @@ $env:CHIVE_PORT="9000"; python server.py
    yt-dlp/ffmpeg versions (with an **Update yt-dlp** button), and free disk.
 4. Hit **Start** in the Queue section.
 5. Watch live progress and the **aggregate stats** (remaining, speed, archived
-   size, ETA). Each row has a **log** button to inspect the full yt-dlp output;
+   size, ETA). Each row has a **log** button to inspect the yt-dlp output — it
+   follows a running download live and is kept across restarts;
    failed items can be diagnosed without re-running in a terminal.
 
 ### Podcasts

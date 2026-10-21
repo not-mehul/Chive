@@ -8,6 +8,8 @@ JSON + Server-Sent Events.
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import json
 import os
 import queue
@@ -30,6 +32,7 @@ from typing import Any
 from urllib.parse import urlparse, urlencode
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +81,9 @@ def _env_truthy(name: str) -> bool:
 # the exact line format can be inspected and shared.
 DEBUG = _env_truthy("DEBUG")
 DOWNLOAD_LOG_DIR = STATE_DIR / "logs"
+# Per-item download logs (what the queue's log button shows). Written as lines
+# arrive so they survive a server restart; deleted when the item is removed.
+ITEM_LOG_DIR = STATE_DIR / "item-logs"
 
 IS_WINDOWS = os.name == "nt"
 
@@ -148,8 +154,8 @@ SCRAPE_ALL_CAP = 2000
 DISK_HARD_MIN = 500 * 1024 * 1024      # refuse to start a download below this
 DISK_SOFT_WARN = 2 * 1024 * 1024 * 1024  # surface a UI warning below this
 
-# Per-item rolling log capacity (lines). Session-only; never persisted.
-LOG_MAX_LINES = 600
+# Per-item log capacity (lines) kept in memory and returned to the viewer.
+LOG_MAX_LINES = 2000
 
 # Matches the 11-char video id our output template embeds as "[<id>]" — used to
 # detect already-downloaded videos by scanning the destination tree.
@@ -157,8 +163,8 @@ _DL_ID_RE = re.compile(r"\[([0-9A-Za-z_-]{11})\]")
 
 # --- Podcasts -------------------------------------------------------------
 # Search via the free Apple/iTunes podcast directory; episodes come from each
-# show's RSS feed (parsed with feedparser). Episodes are plain audio enclosures
-# downloaded by yt-dlp's generic extractor — same queue/progress machinery.
+# show's RSS feed (parsed with the stdlib XML parser). Episodes are plain audio
+# enclosures downloaded by yt-dlp's generic extractor — same queue machinery.
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 PODCAST_PAGE_SIZE = 50
 _HTTP_UA = "Mozilla/5.0 (compatible; Chive/1.0; +local archival)"
@@ -175,13 +181,9 @@ COOKIE_BROWSERS = (
 # yt-dlp invocation
 # ---------------------------------------------------------------------------
 #
-# Prefer running yt-dlp as a module under *our* interpreter
-# (`python -m yt_dlp`) over the standalone `yt-dlp` binary. The Windows
-# standalone build (PyInstaller-frozen) block-buffers its progress output when
-# stdout is a pipe and never flushes it, so the live progress bar / speed / ETA
-# never reach us — the download appears to jump straight from 0% to 100%.
-# Running the module under our own Python (with PYTHONUNBUFFERED set in the
-# child env) streams progress line-by-line, which is what the UI needs.
+# Downloads go through ytdlp_runner.py (see _ytdlp_runner_cmd) when the yt_dlp
+# module is importable. _ytdlp_base is the plain invocation used for scraping,
+# search, --version, and the binary download fallback.
 
 def _ytdlp_base() -> list[str] | None:
     """Return the command prefix used to invoke yt-dlp, or None if unavailable."""
@@ -332,11 +334,16 @@ class QueueManager:
         self._last_quality: str = "1080p"
         self._last_sponsorblock: list[str] = ["sponsor", "selfpromo"]
         self._last_sb_mode: str = "remove"
-        # Session-only per-item yt-dlp output, for the log viewer. Never persisted.
+        # Per-item yt-dlp output for the log viewer: an in-memory tail, mirrored
+        # to ITEM_LOG_DIR/<id>.log so it survives a restart.
         self._logs: dict[str, deque[str]] = {}
+        self._log_files: dict[str, Any] = {}
         # Cached scan of the destination for already-downloaded video ids.
         self._dl_scan: dict[str, Any] | None = None
-        self._persist_dirty = False
+        # Serialises snapshot+write so an older snapshot can never land after
+        # a newer one when two workers finish at the same moment.
+        self._persist_lock = threading.Lock()
+        self._shutting_down = False
         self._load_persisted()
         self._dispatcher = threading.Thread(target=self._dispatch_loop, daemon=True)
         self._dispatcher.start()
@@ -455,10 +462,11 @@ class QueueManager:
             }
 
     def _persist(self) -> None:
-        try:
-            _atomic_write_json(STATE_FILE, self._persist_snapshot())
-        except OSError as exc:
-            print(f"[ytarchive] could not persist state: {exc}", file=sys.stderr)
+        with self._persist_lock:
+            try:
+                _atomic_write_json(STATE_FILE, self._persist_snapshot())
+            except OSError as exc:
+                print(f"[chive] could not persist state: {exc}", file=sys.stderr)
 
     # ----- settings ----------------------------------------------------
 
@@ -637,9 +645,11 @@ class QueueManager:
                 self._order.append(item.id)
                 existing_video_ids.add(vid)
                 added.append(item)
-        for item in added:
-            self._broadcast({"type": "queued", "item": asdict(item)})
         if added:
+            # One event for the whole batch: queueing a 500-episode feed used
+            # to send 500 events, each triggering a full client re-render (and
+            # overflowing a listener's 512-slot buffer, dropping items).
+            self._broadcast({"type": "queued", "items": [asdict(i) for i in added]})
             if source == "youtube":
                 self.remember_choices(quality, clean_sb, sb_mode)
             self._persist()
@@ -657,6 +667,7 @@ class QueueManager:
                 self._order.remove(item_id)
             self._items.pop(item_id, None)
             self._logs.pop(item_id, None)
+        self._delete_log_file(item_id)
         self._broadcast({"type": "removed", "id": item_id})
         self._persist()
         return True
@@ -676,7 +687,8 @@ class QueueManager:
             item.message = None
             item.started_at = None
             item.finished_at = None
-            self._logs.pop(item_id, None)
+            # The previous attempt's log is kept (on disk and in memory); the
+            # next run appends below a separator, so the failure stays visible.
             snap = asdict(item)
         self._broadcast({"type": "update", "item": snap})
         self._persist()
@@ -684,7 +696,7 @@ class QueueManager:
         return True
 
     def clear_finished(self) -> int:
-        removed = 0
+        dropped: list[str] = []
         with self._lock:
             keep: list[str] = []
             for iid in self._order:
@@ -692,10 +704,13 @@ class QueueManager:
                 if it.status in {"completed", "failed", "cancelled"}:
                     self._items.pop(iid, None)
                     self._logs.pop(iid, None)
-                    removed += 1
+                    dropped.append(iid)
                 else:
                     keep.append(iid)
             self._order = keep
+        for iid in dropped:
+            self._delete_log_file(iid)
+        removed = len(dropped)
         if removed:
             self._broadcast({"type": "cleared"})
             self._persist()
@@ -787,19 +802,30 @@ class QueueManager:
         ids |= self._scan_disk_ids(dl_dir)
         return ids
 
-    def podcast_downloaded(self, collection: str, titles: list[str]) -> set[str]:
-        """Which of `titles` already have a file under <dir>/<show>/. Episode
-        files are saved as "<safe title>.<ext>", so we match sanitised stems."""
-        folder = self._download_dir / _safe_segment(collection or "Podcasts")
+    def podcast_downloaded(self, collection: str, episodes: list[dict[str, Any]]) -> set[str]:
+        """Video ids (episode guids) of `episodes` already on disk under
+        <dir>/<show>/. Files are named "<title> [<tag>].<ext>" where the tag is
+        derived from the guid, so same-titled episodes stay distinct. Files from
+        before the tag existed ("<title>.<ext>") still match by title."""
+        folder = self.download_dir / _safe_segment(collection or "Podcasts")
+        tags: set[str] = set()
         stems: set[str] = set()
         try:
             if folder.is_dir():
                 for p in folder.iterdir():
                     if p.is_file() and p.suffix.lower() not in (".part", ".ytdl", ".temp"):
                         stems.add(p.stem)
+                        m = _POD_TAG_RE.search(p.stem)
+                        if m:
+                            tags.add(m.group(1))
         except OSError:
             pass
-        return {t for t in titles if _safe_segment(t) in stems}
+        have: set[str] = set()
+        for ep in episodes:
+            vid = ep.get("video_id") or ""
+            if _pod_tag(vid) in tags or _safe_segment(ep.get("title") or "") in stems:
+                have.add(vid)
+        return have
 
     def _scan_disk_ids(self, dl_dir: Path) -> set[str]:
         now = time.time()
@@ -826,6 +852,45 @@ class QueueManager:
 
     # ----- per-item logs ----------------------------------------------
 
+    @staticmethod
+    def _log_path(item_id: str) -> Path | None:
+        # Ids are uuids we mint, but restored state is user-editable JSON —
+        # never let an id become a path traversal.
+        if not re.fullmatch(r"[\w-]{1,80}", item_id or ""):
+            return None
+        return ITEM_LOG_DIR / f"{item_id}.log"
+
+    def _open_item_log(self, item_id: str) -> None:
+        path = self._log_path(item_id)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(path, "a", encoding="utf-8")
+        except OSError as exc:
+            print(f"[chive] could not open item log: {exc}", file=sys.stderr)
+            return
+        with self._lock:
+            self._log_files[item_id] = fh
+
+    def _close_item_log(self, item_id: str) -> None:
+        with self._lock:
+            fh = self._log_files.pop(item_id, None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    def _delete_log_file(self, item_id: str) -> None:
+        self._close_item_log(item_id)
+        path = self._log_path(item_id)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     def _log_line(self, item_id: str, line: str) -> None:
         with self._lock:
             buf = self._logs.get(item_id)
@@ -833,14 +898,32 @@ class QueueManager:
                 buf = deque(maxlen=LOG_MAX_LINES)
                 self._logs[item_id] = buf
             buf.append(line)
+            fh = self._log_files.get(item_id)
+            if fh is not None:
+                try:
+                    fh.write(line + "\n")
+                    fh.flush()
+                except (OSError, ValueError):
+                    pass
 
     def get_log(self, item_id: str) -> list[str] | None:
+        """The item's log lines — from memory this session, else from disk
+        (logs outlive a restart). None when nothing was ever logged."""
         with self._lock:
             buf = self._logs.get(item_id)
-            return list(buf) if buf is not None else None
+            if buf is not None:
+                return list(buf)
+        path = self._log_path(item_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                return [ln.rstrip("\n") for ln in deque(fh, maxlen=LOG_MAX_LINES)]
+        except OSError:
+            return None
 
     def _open_debug_log(self, item: QueueItem, cmd: list[str]):
-        """When YTARCHIVE_DEBUG is set, open a per-download log file that records
+        """When CHIVE_DEBUG is set, open a per-download log file that records
         the command and every output line with a wall-clock offset, so streaming
         cadence (vs a single end-of-run flush) is visible at a glance."""
         if not DEBUG:
@@ -855,10 +938,10 @@ class QueueManager:
             fh.write("# cmd: " + " ".join(cmd) + "\n")
             fh.write("# Each line is prefixed with seconds since the process started.\n\n")
             fh.flush()
-            print(f"[ytarchive] debug log → {path}", file=sys.stderr)
+            print(f"[chive] debug log → {path}", file=sys.stderr)
             return fh
         except OSError as exc:
-            print(f"[ytarchive] could not open debug log: {exc}", file=sys.stderr)
+            print(f"[chive] could not open debug log: {exc}", file=sys.stderr)
             return None
 
     # ----- aggregate stats --------------------------------------------
@@ -983,33 +1066,26 @@ class QueueManager:
                     break
 
     def _process(self, item: QueueItem) -> None:
+        self._begin_item_log(item)
         # Refuse to start if the destination is critically low on space — a
         # failed write halfway through is worse than not starting.
-        free = _disk_free(self._download_dir)
+        free = _disk_free(self.download_dir)
         if free is not None and free < DISK_HARD_MIN:
             with self._lock:
                 self._dispatched.discard(item.id)
             self._broadcast({"type": "disk", "free_bytes": free, "low": True})
-            self._finish(item, "failed",
-                         f"Insufficient disk space ({_human_bytes(free)} free)")
+            self._end_item(item, "failed",
+                           f"Insufficient disk space ({_human_bytes(free)} free)")
             self._wake.set()
             return
 
         with self._lock:
             item.status = "downloading"
             item.started_at = time.time()
-            self._logs[item.id] = deque(maxlen=LOG_MAX_LINES)
         self._broadcast({"type": "update", "item": asdict(item)})
 
         cmd = self._build_command(item)
         self._log_line(item.id, "$ " + " ".join(cmd))
-        # Force yt-dlp's own stdout to stay unbuffered. yt-dlp is a Python
-        # program, and Python block-buffers stdout when it is a pipe rather than
-        # a TTY — progress lines then pile up and surface as a single 0%→100%
-        # jump at the very end instead of streaming. PYTHONUNBUFFERED guarantees
-        # line-by-line output. (This is the buffering half of a symptom whose
-        # other half was a progress-line parsing bug; see _build_command.)
-        child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         popen_kwargs: dict[str, Any] = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1017,8 +1093,10 @@ class QueueManager:
             bufsize=1,
             encoding="utf-8",
             errors="replace",
-            env=child_env,
         )
+        # Own process group, so cancelling one download can signal its whole
+        # tree (yt-dlp + ffmpeg). Because the group is detached from the
+        # console, shutdown() is what stops them when the server exits.
         if IS_WINDOWS:
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -1026,20 +1104,28 @@ class QueueManager:
 
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)
-        except FileNotFoundError:
+        except OSError as exc:
             with self._lock:
                 self._dispatched.discard(item.id)
-            self._finish(item, "failed", "yt-dlp not found on PATH")
+            msg = "yt-dlp not found on PATH" if isinstance(exc, FileNotFoundError) else str(exc)
+            self._end_item(item, "failed", msg)
             self._wake.set()
             return
         with self._lock:
+            if self._shutting_down:
+                # Raced with shutdown(): don't leave an orphan behind.
+                self._dispatched.discard(item.id)
+                _force_kill(proc)
+                return
             self._active_procs[item.id] = proc
             self._dispatched.discard(item.id)
 
         last_emit = 0.0
         last_progress = -1.0
         last_message: str | None = None
+        logged_step = -1
         archived = False
+        already_on_disk = False
         debug_fh = self._open_debug_log(item, cmd)
         t0 = time.time()
         assert proc.stdout is not None
@@ -1048,17 +1134,31 @@ class QueueManager:
             # can buffer lines on some platforms, which would make progress
             # surface as a single 0%→100% jump at the end.
             for raw in iter(proc.stdout.readline, ""):
-                line = raw.rstrip("\n")
+                line = raw.rstrip("\n").rstrip("\r")
                 if debug_fh is not None:
                     try:
                         debug_fh.write(f"[+{time.time() - t0:8.3f}s] {line}\n")
                         debug_fh.flush()
                     except OSError:
                         pass
-                self._log_line(item.id, line)
                 if "has already been recorded in the archive" in line:
                     archived = True
+                elif "has already been downloaded" in line:
+                    already_on_disk = True
                 self._parse_progress(item, line)
+                if "[YTPROG]" in line:
+                    # Raw progress lines arrive many times a second; the log
+                    # gets a readable summary every 10% instead.
+                    step = int(item.progress // 10)
+                    if step < logged_step:
+                        logged_step = -1          # a new stream started
+                    if step > logged_step:
+                        logged_step = step
+                        self._log_line(item.id, self._progress_summary(item))
+                elif line.startswith("[YTPP]"):
+                    self._log_line(item.id, "[postprocess] " + line[6:].strip())
+                else:
+                    self._log_line(item.id, line)
                 now = time.time()
                 changed = item.progress != last_progress or item.message != last_message
                 if changed and now - last_emit > 0.15:
@@ -1066,35 +1166,102 @@ class QueueManager:
                     last_emit = now
                     last_progress = item.progress
                     last_message = item.message
-        except Exception:
-            pass
+        except Exception as exc:  # keep the worker alive, but leave a trace
+            self._log_line(item.id, f"[chive] output reader error: {exc!r}")
         finally:
             if debug_fh is not None:
                 try:
                     debug_fh.close()
                 except OSError:
                     pass
-        # Flush any tail update so the bar reaches its final value before
-        # the completion event arrives.
-        if item.progress != last_progress or item.message != last_message:
-            self._broadcast({"type": "progress", "item": asdict(item)})
+            try:
+                proc.stdout.close()    # otherwise every download leaks its pipe
+            except OSError:
+                pass
         rc = proc.wait()
         with self._lock:
             self._active_procs.pop(item.id, None)
             paused = item.id in self._pausing
             self._pausing.discard(item.id)
+            shutting_down = self._shutting_down
+        if shutting_down:
+            # Server is exiting: leave the item as-is so it is restored as
+            # pending and resumes from its .part file on the next launch.
+            self._log_line(item.id, "[chive] server shutting down — will resume on next launch")
+            self._close_item_log(item.id)
+            return
+        # Flush any tail update so the bar reaches its final value before
+        # the completion event arrives.
+        if item.progress != last_progress or item.message != last_message:
+            self._broadcast({"type": "progress", "item": asdict(item)})
         if paused:
-            self._finish(item, "paused", "Paused — partial file kept for resume")
-        elif rc == 0 and archived and not item.output_file:
-            self._finish(item, "completed", "Skipped — already in archive")
+            self._end_item(item, "paused", "Paused — partial file kept for resume")
+        elif rc == 0 and archived:
+            self._end_item(item, "completed", "Skipped — already in archive")
+        elif rc == 0 and already_on_disk:
+            self._end_item(item, "completed", "Already on disk")
         elif rc == 0:
-            self._finish(item, "completed", "Saved")
+            self._end_item(item, "completed", "Saved")
         elif rc < 0 or (IS_WINDOWS and rc in (3221225786, -1073741510)):
             # CTRL_BREAK/CTRL_C terminations on Windows surface as 0xC000013A
-            self._finish(item, "cancelled", "Stopped")
+            self._end_item(item, "cancelled", "Stopped")
         else:
-            self._finish(item, "failed", item.message or f"yt-dlp exited {rc}")
+            self._end_item(item, "failed", item.message or f"yt-dlp exited {rc}")
         self._wake.set()
+
+    def _begin_item_log(self, item: QueueItem) -> None:
+        """Open the item's log for a new attempt. Earlier attempts (a retry,
+        a resume, a previous server session) are kept above a separator."""
+        with self._lock:
+            have_memory = item.id in self._logs
+        if not have_memory:
+            previous = self.get_log(item.id) or []
+            with self._lock:
+                self._logs[item.id] = deque(previous, maxlen=LOG_MAX_LINES)
+        self._open_item_log(item.id)
+        with self._lock:
+            started_before = bool(self._logs[item.id])
+        if started_before:
+            self._log_line(item.id, "")
+        self._log_line(item.id, f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} · "
+                                f"{'resuming' if started_before else 'starting'}: {item.title}")
+
+    def _end_item(self, item: QueueItem, status: str, message: str) -> None:
+        self._log_line(item.id, f"=== {status}: {message}")
+        self._close_item_log(item.id)
+        self._finish(item, status, message)
+
+    @staticmethod
+    def _progress_summary(item: QueueItem) -> str:
+        parts = [f"[progress] {item.progress:5.1f}%"]
+        if item.total_bytes:
+            parts.append(f"of {_human_bytes(item.total_bytes)}")
+        if item.speed:
+            parts.append(f"at {item.speed}")
+        if item.eta:
+            parts.append(f"eta {item.eta}")
+        return " ".join(parts)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Stop every running download before the server exits. Downloads run
+        in their own process group, so they would otherwise keep going after
+        the server is gone — and, being restored as pending on the next launch,
+        a second process would then write to the same .part file."""
+        with self._lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+            self._running = False
+            procs = list(self._active_procs.values())
+        for proc in procs:
+            _terminate_proc(proc, escalate=False)
+        deadline = time.time() + timeout
+        for proc in procs:
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                _force_kill(proc)
+        self._persist()
 
     def _finish(self, item: QueueItem, status: str, message: str) -> None:
         with self._lock:
@@ -1139,7 +1306,11 @@ class QueueManager:
         cmd += ["--newline", "--no-colors", "--no-playlist"]
         if runner is None:
             cmd += ["--progress-template", self._PROGRESS_TPL]
-        cmd += ["-o", out_template, "--print", "after_move:filepath:%(filepath)s"]
+        # --print implies --quiet, which silences every status line we rely on
+        # ("…already been recorded in the archive", destinations, errors in
+        # context) and left the log viewer nearly empty. --no-quiet undoes that
+        # while --print still reports the final path.
+        cmd += ["-o", out_template, "--print", "after_move:filepath:%(filepath)s", "--no-quiet"]
         return cmd
 
     def _build_command(self, item: QueueItem) -> list[str]:
@@ -1202,9 +1373,13 @@ class QueueManager:
         # format selection / SponsorBlock / merge) into <dir>/<show>/<episode>.
         # The title/show are literals we already know, so we sanitise them
         # ourselves rather than relying on the generic extractor's metadata.
+        # The [tag] (from the episode guid) keeps same-titled episodes —
+        # "Trailer", "Bonus" — from resolving to one file, where yt-dlp would
+        # skip the second as "already downloaded" and report it as saved.
         safe_show = _safe_segment(item.collection or "Podcasts")
         safe_title = _safe_segment(item.title)
-        out = str(self._download_dir / safe_show / (safe_title + ".%(ext)s"))
+        name = f"{safe_title} [{_pod_tag(item.video_id)}].%(ext)s"
+        out = str(self.download_dir / safe_show / name)
         cmd = self._cmd_prefix(out)
         with self._lock:
             if self._embed_metadata:
@@ -1365,13 +1540,13 @@ class QueueManager:
         if err:
             msg = err.group(1)
             if self._looks_age_restricted(msg):
-                msg = "Age-restricted — add cookies under Configuration → Cookies"
+                msg = "Age-restricted — add cookies under Settings → Access & throughput"
             with self._lock:
                 item.message = msg[:200]
             return
         if self._looks_age_restricted(line):
             with self._lock:
-                item.message = "Age-restricted — add cookies under Configuration → Cookies"
+                item.message = "Age-restricted — add cookies under Settings → Access & throughput"
 
 
 # ---------------------------------------------------------------------------
@@ -1441,7 +1616,7 @@ def _escalate_after_grace(proc: subprocess.Popen) -> None:
         _force_kill(proc)
 
 
-def _terminate_proc(proc: subprocess.Popen) -> bool:
+def _terminate_proc(proc: subprocess.Popen, escalate: bool = True) -> bool:
     if proc.poll() is not None:
         return False
     try:
@@ -1458,7 +1633,8 @@ def _terminate_proc(proc: subprocess.Popen) -> bool:
             proc.terminate()
         except Exception:
             return False
-    threading.Thread(target=_escalate_after_grace, args=(proc,), daemon=True).start()
+    if escalate:
+        threading.Thread(target=_escalate_after_grace, args=(proc,), daemon=True).start()
     return True
 
 
@@ -1800,9 +1976,36 @@ def _safe_segment(name: str) -> str:
     return s[:120] or "untitled"
 
 
+_POD_TAG_RE = re.compile(r"\[([0-9a-f]{8})\]$")
+
+
+def _pod_tag(guid: str) -> str:
+    """Short stable tag for a podcast episode, embedded in its filename."""
+    return hashlib.sha1((guid or "").encode("utf-8")).hexdigest()[:8]
+
+
+def _require_http_url(url: str) -> str:
+    """Only http(s) URLs may be fetched. urllib would otherwise happily read
+    file:// (local files) or ftp:// on the strength of a client-supplied URL."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("feed URL must be an http(s) address")
+    return url.strip()
+
+
+class _HttpOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_http_url(newurl)   # a redirect must not escape to file:// etc.
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTP_OPENER = urllib.request.build_opener(_HttpOnlyRedirects)
+
+
 def _http_get(url: str, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA, "Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    req = urllib.request.Request(_require_http_url(url),
+                                 headers={"User-Agent": _HTTP_UA, "Accept": "*/*"})
+    with _HTTP_OPENER.open(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -1872,7 +2075,7 @@ def fetch_episodes(feed_url: str, page: int, page_size: int = PODCAST_PAGE_SIZE,
     import xml.etree.ElementTree as ET
     try:
         raw = _http_get(feed_url, timeout=30)
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         raise RuntimeError(f"could not fetch feed: {exc}")
     try:
         root = ET.fromstring(raw)
@@ -1930,6 +2133,17 @@ def fetch_episodes(feed_url: str, page: int, page_size: int = PODCAST_PAGE_SIZE,
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 
 
+@app.errorhandler(Exception)
+def _api_error(exc: Exception):
+    """API callers always get JSON, never an HTML traceback page."""
+    if isinstance(exc, HTTPException):
+        if not request.path.startswith("/api/"):
+            return exc
+        return jsonify({"error": exc.description}), exc.code
+    app.logger.exception("unhandled error on %s", request.path)
+    return jsonify({"error": str(exc) or exc.__class__.__name__}), 500
+
+
 @app.route("/")
 def index() -> Response:
     return send_from_directory(STATIC_DIR, "index.html")
@@ -1982,6 +2196,19 @@ def _parse_int(data: dict[str, Any], key: str) -> int | None:
         return None
 
 
+def _int_arg(data: dict[str, Any], key: str, default: int,
+             lo: int | None = None, hi: int | None = None) -> int:
+    """An integer request field, falling back to `default` when missing or
+    malformed, clamped to [lo, hi]."""
+    val = _parse_int(data, key)
+    val = default if val is None else val
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
+
 @app.route("/api/search", methods=["POST"])
 def api_search() -> Response:
     data = request.get_json(force=True, silent=True) or {}
@@ -2014,18 +2241,21 @@ def api_podcast_episodes() -> Response:
     feed = (data.get("feed_url") or "").strip()
     if not feed:
         return jsonify({"error": "feed_url is required"}), 400
-    page = int(data.get("page", 1) or 1)
-    page_size = min(max(int(data.get("page_size", PODCAST_PAGE_SIZE) or PODCAST_PAGE_SIZE), 1), 5000)
+    try:
+        feed = _require_http_url(feed)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    page = _int_arg(data, "page", 1, lo=1)
+    page_size = _int_arg(data, "page_size", PODCAST_PAGE_SIZE, lo=1, hi=5000)
     query = (data.get("query") or "").strip() or None
     try:
         result = fetch_episodes(feed, page=page, page_size=page_size, query=query)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     # Flag episodes already on disk so the UI can gray them out.
-    titles = [v["title"] for v in result["videos"]]
-    have = manager.podcast_downloaded(result["podcast"], titles)
+    have = manager.podcast_downloaded(result["podcast"], result["videos"])
     for v in result["videos"]:
-        v["downloaded"] = v["title"] in have
+        v["downloaded"] = v["video_id"] in have
     return jsonify(result)
 
 
@@ -2033,7 +2263,7 @@ def api_podcast_episodes() -> Response:
 def api_scrape() -> Response:
     data = request.get_json(force=True, silent=True) or {}
     raw = (data.get("url") or "").strip()
-    page = int(data.get("page", 1))
+    page = _int_arg(data, "page", 1, lo=1)
     ignore_shorts = bool(data.get("ignore_shorts", True))
     sort = data.get("sort") or "newest"
     if not raw:
@@ -2047,8 +2277,6 @@ def api_scrape() -> Response:
         # Plain text — tell the client to disambiguate via channel search.
         return jsonify({"needs_search": True, "query": value})
     url = value
-    if page < 1:
-        page = 1
     filters = {
         "query": (data.get("query") or "").strip() or None,
         "duration_min": _parse_int(data, "duration_min"),
@@ -2128,9 +2356,10 @@ def api_queue_log() -> Response:
     if not item_id:
         return jsonify({"error": "id is required"}), 400
     log = manager.get_log(item_id)
+    status = next((it["status"] for it in manager.snapshot() if it["id"] == item_id), None)
     if log is None:
-        return jsonify({"lines": [], "available": False})
-    return jsonify({"lines": log, "available": True})
+        return jsonify({"lines": [], "available": False, "status": status})
+    return jsonify({"lines": log, "available": True, "status": status})
 
 
 @app.route("/api/queue/remove", methods=["POST"])
@@ -2296,10 +2525,11 @@ def api_events() -> Response:
         finally:
             manager.drop(listener)
 
+    # No "Connection" header: it is hop-by-hop, and waitress (PEP 3333) rejects
+    # it with an AssertionError — which killed the stream before it opened.
     headers = {
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
     }
     response = Response(stream(), mimetype="text/event-stream", headers=headers)
     response.direct_passthrough = True
@@ -2322,20 +2552,33 @@ def main() -> None:
         print(f"Debug logs:       {DOWNLOAD_LOG_DIR}  (raw yt-dlp output, timestamped)")
     print()
 
+    # Stop running downloads on every exit path (Ctrl+C, SIGTERM, normal
+    # exit). They run in their own process group, so they don't receive the
+    # console's Ctrl+C and would otherwise outlive the server.
+    atexit.register(manager.shutdown)
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     # Prefer the waitress WSGI server: it serves concurrent requests reliably
     # while a long-lived SSE stream is open (the Flask dev server can drop
     # requests mid-download, surfacing as a "NetworkError" on the log fetch).
     # Fall back to the dev server if waitress isn't installed.
     try:
-        from waitress import serve
-    except ImportError:
-        print("(waitress not installed — using the Flask dev server; "
-              "`pip install -r requirements.txt` for more robust serving)\n")
-        app.run(host=host, port=port, threaded=True, debug=False)
-        return
-    # `threads` caps concurrent workers; each open SSE connection holds one for
-    # its lifetime, so allow plenty of headroom for multiple tabs + requests.
-    serve(app, host=host, port=port, threads=16, channel_timeout=300, ident="Chive")
+        try:
+            from waitress import serve
+        except ImportError:
+            print("(waitress not installed — using the Flask dev server; "
+                  "`pip install -r requirements.txt` for more robust serving)\n")
+            app.run(host=host, port=port, threaded=True, debug=False)
+            return
+        # `threads` caps concurrent workers; each open SSE connection holds one
+        # for its lifetime, so allow headroom for multiple tabs + requests.
+        serve(app, host=host, port=port, threads=16, channel_timeout=300, ident="Chive")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nStopping downloads…")
+        manager.shutdown()
 
 
 if __name__ == "__main__":

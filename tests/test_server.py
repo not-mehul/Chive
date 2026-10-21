@@ -1,7 +1,8 @@
-"""Unit tests for the YTArchive bridge's pure helpers and scrape pagination.
+"""Unit tests for the Chive bridge — helpers, API, and offline runner integration.
 
 Run with:  python3 -m unittest discover -s tests
-No third-party test deps; yt-dlp is mocked so these run offline.
+No third-party test deps; everything runs offline (yt-dlp is mocked, or fed
+from a local HTTP server).
 """
 
 import json
@@ -12,7 +13,7 @@ from unittest import mock
 
 # Point persistence at a throwaway dir before importing the module under test —
 # importing it constructs the QueueManager singleton, which reads state on init.
-os.environ["YTARCHIVE_STATE_DIR"] = tempfile.mkdtemp(prefix="ytarchive-test-")
+os.environ["CHIVE_STATE_DIR"] = tempfile.mkdtemp(prefix="chive-test-")
 
 import server  # noqa: E402
 
@@ -326,6 +327,212 @@ class BroadcastEvictionTests(unittest.TestCase):
             self.assertLessEqual(len(drained), q.maxsize)
         finally:
             m.drop(q)
+
+
+def _item(**kw):
+    base = dict(id="x", video_id="v", url="https://www.youtube.com/watch?v=v",
+                title="t", thumbnail=None, duration=None, quality="1080p",
+                sponsorblock=[])
+    base.update(kw)
+    return server.QueueItem(**base)
+
+
+class QuietModeTests(unittest.TestCase):
+    def test_print_does_not_silence_status_lines(self):
+        # --print implies --quiet, which hid the archive-skip message and left
+        # the log empty; --no-quiet must accompany it.
+        for it in (_item(), _item(source="podcast", collection="Show")):
+            cmd = server.manager._build_command(it)
+            self.assertIn("--print", cmd)
+            self.assertIn("--no-quiet", cmd)
+
+
+class PodcastFilenameTests(unittest.TestCase):
+    def test_same_title_episodes_get_distinct_files(self):
+        out = lambda c: c[c.index("-o") + 1]  # noqa: E731
+        a = server.manager._build_command(_item(id="a", video_id="guid-a", title="Trailer",
+                                                source="podcast", collection="Show"))
+        b = server.manager._build_command(_item(id="b", video_id="guid-b", title="Trailer",
+                                                source="podcast", collection="Show"))
+        self.assertNotEqual(out(a), out(b))
+
+    def test_downloaded_detection_by_tag_and_legacy_title(self):
+        import pathlib
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / "Show").mkdir()
+        tag = server._pod_tag("guid-a")
+        (d / "Show" / f"Trailer [{tag}].mp3").write_text("x")
+        (d / "Show" / "Old Episode.mp3").write_text("x")          # pre-tag naming
+        (d / "Show" / f"Partial [{server._pod_tag('guid-c')}].mp3.part").write_text("x")
+        prev = server.manager._download_dir
+        server.manager._download_dir = d
+        try:
+            have = server.manager.podcast_downloaded("Show", [
+                {"video_id": "guid-a", "title": "Trailer"},
+                {"video_id": "guid-b", "title": "Trailer"},        # same title, not on disk
+                {"video_id": "guid-c", "title": "Partial"},        # only a .part
+                {"video_id": "guid-d", "title": "Old Episode"},
+            ])
+        finally:
+            server.manager._download_dir = prev
+        self.assertEqual(have, {"guid-a", "guid-d"})
+
+
+class ItemLogTests(unittest.TestCase):
+    def test_log_survives_losing_memory(self):
+        m = server.manager
+        m._open_item_log("logtest-1")
+        m._log_line("logtest-1", "hello")
+        m._log_line("logtest-1", "world")
+        m._close_item_log("logtest-1")
+        with m._lock:
+            m._logs.pop("logtest-1", None)      # as after a server restart
+        self.assertEqual(m.get_log("logtest-1"), ["hello", "world"])
+        m._delete_log_file("logtest-1")
+        self.assertIsNone(m.get_log("logtest-1"))
+
+    def test_unsafe_id_never_becomes_a_path(self):
+        self.assertIsNone(server.QueueManager._log_path("../../etc/passwd"))
+        self.assertIsNone(server.QueueManager._log_path(""))
+
+
+class ShutdownTests(unittest.TestCase):
+    def test_shutdown_stops_running_downloads(self):
+        import subprocess
+        import sys
+        m = server.QueueManager()   # a private manager — shutdown is one-way
+        kw = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if server.IS_WINDOWS
+              else {"start_new_session": True})
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], **kw)
+        try:
+            with m._lock:
+                m._active_procs["sleeper"] = proc
+            m.shutdown(timeout=5)
+            self.assertIsNotNone(proc.poll())
+            self.assertFalse(m.is_running())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = server.app.test_client()
+
+    def test_malformed_page_is_not_a_500(self):
+        with mock.patch.object(server, "scrape_channel",
+                               return_value={"videos": [], "page": 1}) as sc:
+            r = self.client.post("/api/scrape", json={"url": "@chan", "page": "abc"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(sc.call_args[0][1], 1)       # fell back to page 1
+
+    def test_feed_url_must_be_http(self):
+        r = self.client.post("/api/podcast/episodes", json={"feed_url": "file:///etc/hostname"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("http", r.get_json()["error"])
+        with self.assertRaises(ValueError):
+            server._http_get("file:///etc/hostname")
+
+    def test_api_errors_are_json(self):
+        r = self.client.get("/api/does-not-exist")
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("error", r.get_json())
+
+    def test_event_stream_has_no_hop_by_hop_header(self):
+        # waitress rejects a "Connection" header from a WSGI app (PEP 3333),
+        # which killed the SSE stream before it opened.
+        r = self.client.get("/api/events")
+        try:
+            self.assertEqual(r.status_code, 200)
+            self.assertNotIn("Connection", r.headers)
+        finally:
+            r.close()
+
+    def test_add_broadcasts_one_event_per_batch(self):
+        m = server.manager
+        q = m.listen()
+        try:
+            with mock.patch.object(m, "_persist"):
+                added = m.add([{"video_id": f"batch{i:07d}"} for i in range(5)], "1080p", [])
+            events = []
+            while not q.empty():
+                events.append(json.loads(q.get_nowait()))
+            queued = [e for e in events if e["type"] == "queued"]
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(len(queued[0]["items"]), 5)
+        finally:
+            m.drop(q)
+            for it in added:
+                m.remove(it.id)
+
+
+@unittest.skipUnless(server._ytdlp_runner_cmd(), "yt_dlp module not installed")
+class RunnerIntegrationTests(unittest.TestCase):
+    """Real downloads through ytdlp_runner.py, offline, from a local HTTP server."""
+
+    @classmethod
+    def setUpClass(cls):
+        import functools
+        import http.server
+        import threading
+        cls.media = tempfile.mkdtemp()
+        with open(os.path.join(cls.media, "ep.mp3"), "wb") as fh:
+            fh.write(os.urandom(256 * 1024))
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):
+                pass
+        handler = functools.partial(Quiet, directory=cls.media)
+        cls.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.httpd.server_address[1]}/ep.mp3"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        import pathlib
+        self.m = server.manager
+        self.prev = (self.m._download_dir, self.m._embed_metadata)
+        self.m._download_dir = pathlib.Path(tempfile.mkdtemp())
+        self.m._embed_metadata = False   # no ffmpeg needed for random bytes
+
+    def tearDown(self):
+        self.m._download_dir, self.m._embed_metadata = self.prev
+
+    def _run(self, item, extra=()):
+        real = self.m._build_command
+        with mock.patch.object(self.m, "_build_command",
+                               side_effect=lambda it: real(it)[:-1] + list(extra) + [it.url]):
+            self.m._process(item)
+        return item
+
+    def test_download_completes_with_readable_log(self):
+        it = self._run(_item(id="int-1", video_id="g-1", url=self.url, title="Ep",
+                             source="podcast", collection="Show"))
+        self.assertEqual(it.status, "completed", it.message)
+        self.assertEqual(it.message, "Saved")
+        self.assertTrue(it.output_file and os.path.exists(it.output_file))
+        log = self.m.get_log("int-1")
+        self.assertTrue(any(ln.startswith("=== ") for ln in log))
+        self.assertTrue(any("[download] Destination" in ln for ln in log))  # not silenced
+        self.assertTrue(any(ln.startswith("[progress]") for ln in log))
+        self.assertFalse(any("[YTPROG]" in ln for ln in log))              # summarised
+        self.m._delete_log_file("int-1")
+
+    def test_archive_skip_is_reported(self):
+        archive = os.path.join(str(self.m._download_dir), "archive.txt")
+        extra = ["--download-archive", archive]
+        first = self._run(_item(id="int-2", video_id="g-2", url=self.url, title="A",
+                                source="podcast", collection="Show"), extra)
+        self.assertEqual(first.message, "Saved")
+        again = self._run(_item(id="int-3", video_id="g-3", url=self.url, title="B",
+                                source="podcast", collection="Show"), extra)
+        self.assertEqual(again.status, "completed")
+        self.assertEqual(again.message, "Skipped — already in archive")
+        for i in ("int-2", "int-3"):
+            self.m._delete_log_file(i)
 
 
 if __name__ == "__main__":

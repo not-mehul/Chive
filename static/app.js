@@ -1,4 +1,4 @@
-// YTArchive frontend bridge client.
+// Chive frontend — talks to the local bridge (server.py) over JSON + SSE.
 
 // Human labels for SponsorBlock category ids. The set of ids actually rendered
 // is driven by the server (state.sbCategories) so the two can't drift; this map
@@ -652,7 +652,9 @@ async function toggleCard(videoId) {
 }
 
 function markCard(videoId, on) {
-  const card = document.querySelector(`.video-card[data-id="${videoId}"]`);
+  // Escape: podcast guids are arbitrary strings and may contain quotes or
+  // backslashes, which would otherwise throw on an unescaped selector.
+  const card = document.querySelector(`.video-card[data-id="${CSS.escape(String(videoId))}"]`);
   if (!card) return;
   card.classList.toggle("selected", on);
   card.setAttribute("aria-pressed", on ? "true" : "false");
@@ -833,7 +835,7 @@ function renderEngineStrip(h) {
   if (note) {
     if (h.yt_dlp_source === "binary") {
       note.hidden = false;
-      note.textContent = "Using the standalone yt-dlp binary — progress can stall on Windows. Run `pip install yt-dlp` so the server can use python -m yt_dlp for live progress.";
+      note.textContent = "Using the standalone yt-dlp binary — progress can stall on Windows. Run `pip install yt-dlp` in the server's Python so Chive can drive yt-dlp directly for live progress.";
     } else {
       note.hidden = true;
     }
@@ -1245,13 +1247,17 @@ function handleEvent(payload) {
       break;
     }
     case "queued": {
-      const it = payload.item;
-      if (it) {
-        const ix = state.queue.findIndex((x) => x.id === it.id);
-        if (ix >= 0) state.queue[ix] = it; else state.queue.push(it);
-        renderQueue();
-        renderGrid();
+      // One event per batch (queueing a whole feed is a single event), so the
+      // queue and grid re-render once rather than once per item.
+      const items = payload.items || (payload.item ? [payload.item] : []);
+      if (!items.length) break;
+      const byId = new Map(state.queue.map((x, ix) => [x.id, ix]));
+      for (const it of items) {
+        const ix = byId.get(it.id);
+        if (ix != null) state.queue[ix] = it; else state.queue.push(it);
       }
+      renderQueue();
+      renderGrid();
       break;
     }
     case "update":
@@ -1281,9 +1287,22 @@ function handleEvent(payload) {
       break;
     }
     case "removed": {
+      const gone = state.queue.find((x) => x.id === payload.id);
       state.queue = state.queue.filter((x) => x.id !== payload.id);
-      renderQueue();
-      renderGrid();
+      // Drop just that row — "Unqueue all" sends one event per item, and a
+      // full queue rebuild for each made it crawl on long queues.
+      const row = document.querySelector(`.qitem[data-id="${CSS.escape(String(payload.id))}"]`);
+      if (row && state.queue.length) {
+        row.remove();
+        $("#q-count").textContent = String(state.queue.length);
+        $("#q-meta").textContent = state.queue.length === 1 ? "item" : "items";
+        recomputeQueuedIds();
+        renderQueueStats();
+      } else {
+        renderQueue();
+      }
+      if (gone) markCard(gone.video_id, state.queuedIds.has(gone.video_id));
+      updateSelectedCount();
       break;
     }
     case "cleared": {
@@ -1319,13 +1338,20 @@ function handleEvent(payload) {
       if ("cookies_browser" in payload) { state.cookiesBrowser = payload.cookies_browser || ""; advancedDirty = true; }
       if ("cookies_file" in payload) { state.cookiesFile = payload.cookies_file || ""; advancedDirty = true; }
       if (advancedDirty) renderAdvancedPanel();
+      // Subtitle changes made in another tab.
+      let subsDirty = false;
+      if ("subtitles" in payload) { state.subtitles = !!payload.subtitles; subsDirty = true; }
+      if (typeof payload.subtitle_langs === "string") { state.subtitleLangs = payload.subtitle_langs; subsDirty = true; }
+      if ("subtitle_auto" in payload) { state.subtitleAuto = !!payload.subtitle_auto; subsDirty = true; }
+      if ("subtitle_embed" in payload) { state.subtitleEmbed = !!payload.subtitle_embed; subsDirty = true; }
+      if (subsDirty) renderSubtitlesPanel();
       break;
     }
   }
 }
 
 function patchQItem(it) {
-  const node = document.querySelector(`.qitem[data-id="${it.id}"]`);
+  const node = document.querySelector(`.qitem[data-id="${CSS.escape(String(it.id))}"]`);
   if (!node) { renderQueue(); return; }
 
   // Status changes (pending → downloading → completed/failed) restructure the
@@ -1363,54 +1389,94 @@ function patchQItem(it) {
 
 // ---------- log viewer ----------
 
-let currentLog = { title: "", text: "" };
+// The open log: which item, its text, and the live-follow timer. `token`
+// guards against a slow response for a previously opened item overwriting the
+// one now on screen.
+let currentLog = { id: null, title: "", text: "", token: 0, timer: null };
+const LOG_FOLLOW_MS = 1500;
 
-async function openLog(id, title) {
+async function fetchLog(id) {
+  // Plain GET with one retry: a request can be dropped while the server is
+  // busy streaming SSE + a download at the same moment.
+  const url = `/api/queue/log?id=${encodeURIComponent(id)}`;
+  let resp;
+  try {
+    resp = await fetch(url, { method: "GET", cache: "no-store" });
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 400));
+    resp = await fetch(url, { method: "GET", cache: "no-store" });
+  }
+  if (!resp.ok) throw new Error(`server returned HTTP ${resp.status}`);
+  return resp.json();
+}
+
+async function refreshLog(token) {
+  const body = $("#log-modal-body");
+  const live = $("#log-modal-live");
+  if (!body || token !== currentLog.token) return;
+  let data;
+  try {
+    data = await fetchLog(currentLog.id);
+  } catch (err) {
+    if (token !== currentLog.token) return;
+    if (!currentLog.text) {
+      body.textContent = `Could not load the log: ${err.message || err}.`;
+    }
+    scheduleLogRefresh(token);   // transient while following — try again
+    return;
+  }
+  if (token !== currentLog.token) return;
+  const following = data.status === "downloading" || data.status === "pending";
+  if (live) live.hidden = !following;
+  const text = data.available && data.lines.length ? data.lines.join("\n") : "";
+  if (!text) {
+    body.textContent = following
+      ? "(waiting for output…)"
+      : "(no log recorded for this item yet — it appears once the download starts)";
+  } else if (text !== currentLog.text) {
+    // Stick to the bottom only if the reader hasn't scrolled up to read.
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    body.textContent = text;
+    if (atBottom || !currentLog.text) body.scrollTop = body.scrollHeight;
+  }
+  currentLog.text = text;
+  if (following) scheduleLogRefresh(token);
+}
+
+function scheduleLogRefresh(token) {
+  clearTimeout(currentLog.timer);
+  currentLog.timer = setTimeout(() => refreshLog(token), LOG_FOLLOW_MS);
+}
+
+function openLog(id, title) {
   const modal = $("#log-modal");
   const body = $("#log-modal-body");
   const head = $("#log-modal-title");
   if (!modal || !body) return;
+  clearTimeout(currentLog.timer);
+  currentLog = { id, title, text: "", token: currentLog.token + 1, timer: null };
   head.textContent = `Log · ${title}`;
   body.textContent = "Loading…";
-  currentLog = { title, text: "" };
   modal.hidden = false;
-  try {
-    // Plain fetch (no JSON request headers on a GET) with explicit error
-    // reporting — the shared api() helper masked transport failures as a bare
-    // "NetworkError". Retry once: the dev server can drop a request when it is
-    // busy streaming SSE + a download at the same moment.
-    const url = `/api/queue/log?id=${encodeURIComponent(id)}`;
-    let resp;
-    try {
-      resp = await fetch(url, { method: "GET", cache: "no-store" });
-    } catch (e) {
-      await new Promise((r) => setTimeout(r, 400));
-      resp = await fetch(url, { method: "GET", cache: "no-store" });
-    }
-    if (!resp.ok) throw new Error(`server returned HTTP ${resp.status}`);
-    const data = await resp.json();
-    if (!data.available) {
-      body.textContent = "(no log for this item — per-item logs are kept only for the current server session and are cleared on restart. Run the server with YTARCHIVE_DEBUG=1 to also write timestamped log files to ~/.ytarchive/logs.)";
-    } else if (!data.lines.length) {
-      body.textContent = "(no output captured yet)";
-    } else {
-      currentLog.text = data.lines.join("\n");
-      body.textContent = currentLog.text;
-      body.scrollTop = body.scrollHeight;
-    }
-  } catch (err) {
-    body.textContent =
-      `Could not load the log: ${err.message || err}.\n\n` +
-      `If this keeps happening, run the server with YTARCHIVE_DEBUG=1 and reproduce the ` +
-      `download — a timestamped raw log is written to ~/.ytarchive/logs that you can share.`;
-  }
+  refreshLog(currentLog.token);
+}
+
+function showStaticLog(title, text) {
+  // For one-off output (e.g. the yt-dlp update) — not tied to a queue item.
+  clearTimeout(currentLog.timer);
+  currentLog = { id: null, title, text, token: currentLog.token + 1, timer: null };
+  $("#log-modal-title").textContent = title;
+  $("#log-modal-body").textContent = text;
+  const live = $("#log-modal-live");
+  if (live) live.hidden = true;
+  $("#log-modal").hidden = false;
 }
 
 function saveLog() {
   if (!currentLog.text) { toast("Nothing to save yet.", "notice"); return; }
   const safe = (currentLog.title || "log").replace(/[^\w.-]+/g, "_").slice(0, 60);
   const blob = new Blob([currentLog.text], { type: "text/plain" });
-  const a = el("a", { href: URL.createObjectURL(blob), download: `ytarchive-${safe}.log` });
+  const a = el("a", { href: URL.createObjectURL(blob), download: `chive-${safe}.log` });
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
@@ -1419,6 +1485,8 @@ function saveLog() {
 function closeLog() {
   const modal = $("#log-modal");
   if (modal) modal.hidden = true;
+  clearTimeout(currentLog.timer);
+  currentLog.token++;   // stop any in-flight refresh from re-arming
 }
 
 // ---------- settings modal ----------
@@ -1446,11 +1514,9 @@ async function updateYtdlp() {
     const r = await api("/api/tools/update-ytdlp", { method: "POST" });
     toast(r.ok ? `yt-dlp: ${r.version || "updated"}` : "yt-dlp update reported an issue — see log.",
           r.ok ? "" : "notice");
-    if (r.output) {
-      const head = $("#log-modal-title");
-      const body = $("#log-modal-body");
-      if (head && body) { head.textContent = "yt-dlp update"; body.textContent = r.output; $("#log-modal").hidden = false; }
-    }
+    // Through showStaticLog so "Download .log" saves this output, not the
+    // last item log that was open.
+    if (r.output) showStaticLog("yt-dlp update", r.output);
     checkHealth();
   } catch (err) {
     toast(err.message || "Update failed.", "error");
@@ -1694,7 +1760,7 @@ function initEasterEggs() {
   try {
     console.log(
       "%c🌱 Chive %c— ar·chive everything, snip the fluff.",
-      "font-weight:bold;color:#a7d65a",
+      "font-weight:bold;color:#84c95c",
       "color:#9a8",
     );
     console.log("%cpsst — try the Konami code: ↑ ↑ ↓ ↓ ← → ← → b a", "color:#c9a8e0;font-style:italic");
