@@ -134,6 +134,24 @@ DEFAULT_QUALITY = "1080p"
 # Podcast episodes are downloaded as published; they carry no quality preset.
 PODCAST_QUALITY = "original"
 
+# Music: best audio, extracted to a taggable container (both carry cover art).
+MUSIC_FORMATS: dict[str, dict[str, Any]] = {
+    "mp3": {"label": "MP3", "format": "ba/b", "audio_format": "mp3",
+            "hint": "MP3 (VBR, best quality) — plays everywhere."},
+    "m4a": {"label": "M4A", "format": "ba[ext=m4a]/ba/b", "audio_format": "m4a",
+            "hint": "M4A / AAC — usually no re-encode from YouTube."},
+}
+DEFAULT_MUSIC_FORMAT = "mp3"
+
+# Top-level folders (inside the download folder) for the newer sources.
+# YouTube and podcasts keep their original layout for compatibility.
+MUSIC_DIR = "Music"
+WEB_DIR = "Web"
+
+# Podcast auto-sync choices, in hours (0 = off).
+PODCAST_SYNC_CHOICES = (0, 1, 6, 12, 24)
+RESOLVE_LIMIT = 300         # entries listed for a music/web URL
+
 # yt-dlp's accepted --cookies-from-browser values, offered as a closed list.
 COOKIE_BROWSERS = (
     "brave", "chrome", "chromium", "edge", "firefox",

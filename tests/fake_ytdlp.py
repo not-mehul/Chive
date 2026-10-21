@@ -4,8 +4,11 @@
     fake_ytdlp.py fail           an ERROR line, exit 1
     fake_ytdlp.py archived       the archive-skip line, exit 0
     fake_ytdlp.py hang           a progress line, then sleeps until killed
+    fake_ytdlp.py tracks <dir>   writes two album tracks, reports them as [YTFILE] lines
 """
 
+import json
+import os
 import sys
 import time
 
@@ -33,6 +36,18 @@ def main() -> int:
         return 1
     if mode == "archived":
         say("[download] v: v has already been recorded in the archive")
+        return 0
+    if mode == "tracks":
+        folder = sys.argv[2]
+        os.makedirs(folder, exist_ok=True)
+        say("[YTPROG] 100|100|None|1.0|0|finished|mp3")
+        say("filepath:" + os.path.join(folder, "Album.mp3"))     # the unsplit file, printed first
+        say("[YTPP] ChiveSplit")
+        for n, title in ((1, "One"), (2, "Two")):
+            path = os.path.join(folder, f"{n:02d} - {title}.mp3")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * 500)
+            say("[YTFILE] " + json.dumps({"path": path, "title": title, "track": n, "duration": 10}))
         return 0
     if mode == "hang":
         say("[YTPROG] 100|10000|None|10.0|990|downloading|mp4")

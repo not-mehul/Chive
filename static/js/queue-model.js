@@ -1,8 +1,8 @@
 // The queue as data: applying server events and deriving stats. Pure — no
 // DOM — so the event logic is unit-tested under Node.
 
-export const ACTIVE = new Set(["pending", "downloading", "paused"]);
-export const FINISHED = new Set(["completed", "failed", "cancelled"]);
+const ACTIVE = new Set(["pending", "downloading", "paused"]);
+const FINISHED = new Set(["completed", "failed", "cancelled"]);
 
 /**
  * Apply one SSE payload to `queue` (an array of items). Returns the new queue

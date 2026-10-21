@@ -1,22 +1,50 @@
 // Chive frontend — talks to the local bridge (server.py) over JSON + SSE.
 //
 // Module map: format.js (pure formatting) · queue-model.js (pure queue/event
-// logic) · dom.js · api.js · modal.js · log-viewer.js · eggs.js. This file
-// owns page state, rendering and event bindings.
+// logic) · dom.js · api.js · modal.js · log-viewer.js · library.js ·
+// notifications.js · eggs.js. This file owns the Archive view's state,
+// rendering and bindings, and the view switching.
 
 import { api, post } from "./api.js";
 import { $, ICONS, byDataId, el, svgEl, toast } from "./dom.js";
 import { initEasterEggs } from "./eggs.js";
 import { fmtBytes, fmtClock, fmtDate, fmtDuration, fmtViews, plural } from "./format.js";
+import { focusLibrarySearch, initLibrary, onLibraryChanged, showLibrary } from "./library.js";
 import { initLogViewer, openLog, showStaticLog } from "./log-viewer.js";
 import { closeModal, initModals, openModal } from "./modal.js";
+import { initNotifications, notify, updateTitle } from "./notifications.js";
 import { applyQueueEvent, isIndeterminate, queueStats, queuedVideoIds, statusText } from "./queue-model.js";
 
 const EMPTY_FILTERS = { durationMin: "", durationMax: "", viewsMin: "", viewsMax: "", dateFrom: "", dateTo: "" };
 
+const MODES = {
+  youtube: { title: "Channel or playlist", placeholder: "URL, @handle, or a channel name to search…",
+    filter: "Search titles across the whole channel…", queueAll: "Queue every video on this page",
+    hint: "Paste a channel/playlist URL or an @handle, or type a name to search. Click a thumbnail to queue it." },
+  podcast: { title: "Find a podcast", placeholder: "Search podcasts by name…",
+    filter: "Search episode titles…", queueAll: "Queue every episode of this podcast",
+    hint: "Search a podcast, pick a show, then click episodes to queue them — or queue the whole feed." },
+  music: { title: "Albums & tracks", placeholder: "Album/playlist URL, or an album to search…",
+    filter: "Filter these results…", queueAll: "Queue everything listed",
+    hint: "Paste a YouTube Music, Bandcamp or SoundCloud album/playlist, or a full-album video — "
+      + "or search. Full albums are split into tagged tracks by chapter." },
+  web: { title: "Any site", placeholder: "Link to a video or playlist on any site yt-dlp supports…",
+    filter: "Filter these results…", queueAll: "Queue everything listed",
+    hint: "Vimeo, Twitch VODs, SoundCloud, news sites and more — anything yt-dlp supports. "
+      + "Saved under Web/<site>/." },
+};
+
 const state = {
-  mode: "youtube",    // youtube | podcast
+  mode: "youtube",    // youtube | podcast | music | web
   podcast: null,      // { name, feed_url, artwork } once a show is picked
+  allVideos: [],      // music/web: the whole resolved list, paged client-side
+  follows: [],
+  musicFormats: [],
+  musicFormat: "mp3",
+  musicKeepFull: false,
+  syncHours: 0,
+  syncChoices: [0],
+  remainingBefore: 0, // for the "queue finished" notification
   channelUrl: "",
   page: 1,
   filtered: false,
@@ -115,6 +143,26 @@ function renderQuality() {
   $("#quality-hint").textContent = current ? current.hint : "";
 }
 
+function renderMusicFormat() {
+  const seg = $("#music-format-seg");
+  seg.replaceChildren(...state.musicFormats.map((f) => {
+    const on = f.id === state.musicFormat;
+    return el("button", { type: "button", role: "radio", class: on ? "active" : "",
+      "aria-checked": on ? "true" : "false",
+      onclick: () => { state.musicFormat = f.id; renderMusicFormat(); saveSettings({ music_format: f.id }); } },
+    f.label);
+  }));
+  const cur = state.musicFormats.find((f) => f.id === state.musicFormat);
+  $("#music-format-hint").textContent = cur ? cur.hint : "";
+  $("#music-keep-full").checked = state.musicKeepFull;
+  const sel = $("#sync-hours");
+  if (sel.options.length !== state.syncChoices.length) {
+    sel.replaceChildren(...state.syncChoices.map((h) =>
+      el("option", { value: String(h) }, h === 0 ? "Off — only when I ask" : `Every ${plural(h, "hour")}`)));
+  }
+  sel.value = String(state.syncHours);
+}
+
 function qualityLabel(id) {
   const q = state.qualities.find((x) => x.id === id);
   return q ? q.label : id;
@@ -188,6 +236,8 @@ const SETTING_KEYS = {
   embed_chapters: "embedChapters", use_archive: "useArchive", subtitles: "subtitles",
   subtitle_langs: "subtitleLangs", subtitle_auto: "subtitleAuto", subtitle_embed: "subtitleEmbed",
   cookies_browser: "cookiesBrowser", cookies_file: "cookiesFile", history: "history",
+  music_format: "musicFormat", music_keep_full: "musicKeepFull", podcast_sync_hours: "syncHours",
+  podcast_follows: "follows",
 };
 
 function applySettingFields(s) {
@@ -198,6 +248,8 @@ function applySettingFields(s) {
   if ("history" in s) renderHistory();
   renderAdvancedPanel();
   renderSubtitlesPanel();
+  renderMusicFormat();
+  if ("podcast_follows" in s) renderFollows();
 }
 
 function applySettings(s) {
@@ -206,6 +258,8 @@ function applySettings(s) {
   if (Array.isArray(s.indeterminate_phases)) state.phases = new Set(s.indeterminate_phases);
   if (typeof s.max_concurrency === "number") state.maxConcurrency = s.max_concurrency;
   if (Array.isArray(s.cookie_browsers)) state.cookieBrowsers = s.cookie_browsers;
+  if (Array.isArray(s.music_formats)) state.musicFormats = s.music_formats;
+  if (Array.isArray(s.podcast_sync_choices)) state.syncChoices = s.podcast_sync_choices;
   if (typeof s.last_quality === "string") state.quality = s.last_quality;
   if (Array.isArray(s.last_sponsorblock)) state.sponsorblock = new Set(s.last_sponsorblock);
   if (typeof s.last_sb_mode === "string") state.sbMode = s.last_sb_mode;
@@ -274,12 +328,13 @@ async function updateYtdlp() {
 // ---------- source: YouTube ⇄ podcast mode ----------
 
 function setMode(mode) {
-  state.mode = mode === "podcast" ? "podcast" : "youtube";
+  state.mode = MODES[mode] ? mode : "youtube";
   state.podcast = null;
   state.videos = [];
+  state.allVideos = [];
   state.page = 1;
   state.filter = "";
-  const podcast = state.mode === "podcast";
+  const m = MODES[state.mode];
   document.documentElement.dataset.mode = state.mode;
   $("#mode-seg").querySelectorAll("button").forEach((b) => {
     const on = b.dataset.mode === state.mode;
@@ -288,22 +343,20 @@ function setMode(mode) {
   });
   const input = $("#channel-url");
   input.value = "";
-  input.placeholder = podcast ? "Search podcasts by name…" : "URL, @handle, or a channel name to search…";
+  input.placeholder = m.placeholder;
   const gf = $("#grid-filter");
   gf.value = "";
-  gf.placeholder = podcast ? "Search episode titles…" : "Search titles across the whole channel…";
-  $("#select-page").title = podcast ? "Queue every episode of this podcast" : "Queue every video on this page";
-  $("#src-title").textContent = podcast ? "Find a podcast" : "Channel or playlist";
-  $("#scrape-hint").textContent = podcast
-    ? "Search a podcast, pick a show, then click episodes to queue them — or queue the whole feed."
-    : "Paste a channel/playlist URL or an @handle, or type a name to search. Click a thumbnail to queue it.";
+  gf.placeholder = m.filter;
+  $("#select-page").title = m.queueAll;
+  $("#src-title").textContent = m.title;
+  $("#scrape-hint").textContent = m.hint;
   hideResults();
   $("#channel-meta").hidden = true;
   $("#grid-section").hidden = true;
 }
 
-const submitSource = () => (state.mode === "podcast" ? podcastSearch() : scrape());
-const loadCurrent = () => (state.mode === "podcast" ? loadEpisodes() : loadPage());
+const submitSource = () => ({ podcast: podcastSearch, music: resolveMusic, web: resolveWeb }[state.mode] || scrape)();
+const loadCurrent = () => ({ podcast: loadEpisodes, music: pageResolved, web: pageResolved }[state.mode] || loadPage)();
 
 function hideResults() {
   const box = $("#channel-results");
@@ -435,6 +488,61 @@ async function podcastSearch() {
   }
 }
 
+// ---------- podcast follows ----------
+
+function renderFollows() {
+  const list = $("#follow-list");
+  $("#follow-strip").classList.toggle("is-empty", !state.follows.length);
+  if (!state.follows.length) {
+    list.replaceChildren(el("p", { class: "muted follow-empty" },
+      "Follow a show to keep it archived — new episodes are queued when Chive checks for them."));
+  } else {
+    list.replaceChildren(...state.follows.map((f) => el("span", { class: "follow-chip" }, [
+      el("button", { type: "button", class: "follow-open", title: `Open ${f.name}`,
+        onclick: () => openPodcast(f) }, [
+        f.artwork ? el("img", { src: f.artwork, alt: "", loading: "lazy" }) : null, f.name]),
+      el("button", { type: "button", class: "follow-x", title: `Unfollow ${f.name}`, "aria-label": `Unfollow ${f.name}`,
+        onclick: () => setFollow(f, false) }, svgEl(ICONS.close, 11)),
+    ])));
+  }
+  const btn = $("#follow-btn");
+  const on = !!state.podcast && state.follows.some((f) => f.feed_url === state.podcast.feed_url);
+  btn.textContent = on ? "Following ✓" : "Follow";
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  btn.classList.toggle("active", on);
+}
+
+async function setFollow(show, on) {
+  try {
+    const r = await post(on ? "/api/podcast/follow" : "/api/podcast/unfollow",
+      { feed_url: show.feed_url, name: show.name, artwork: show.artwork });
+    state.follows = r.follows;
+    renderFollows();
+    toast(on ? `Following ${show.name} — new episodes will be queued when Chive checks.` : `Unfollowed ${show.name}.`);
+  } catch (err) { toast(err.message, "error"); }
+}
+
+async function syncFollows(feedUrl) {
+  const btn = $("#sync-all");
+  btn.disabled = true;
+  try {
+    const r = await post("/api/podcast/sync", feedUrl ? { feed_url: feedUrl } : {});
+    const errors = Object.keys(r.errors || {});
+    toast(r.added ? `Queued ${plural(r.added, "new episode")}.` : "No new episodes.", r.added ? "" : "notice");
+    if (errors.length) toast(`Couldn't check: ${errors.join(", ")}`, "error");
+  } catch (err) { toast(err.message, "error"); }
+  finally { btn.disabled = false; }
+}
+
+async function importOpml(file) {
+  try {
+    const r = await post("/api/podcast/opml", { opml: await file.text() });
+    state.follows = r.follows;
+    renderFollows();
+    toast(`Imported — now following ${plural(r.added, "new show")}.`);
+  } catch (err) { toast(err.message, "error"); }
+}
+
 function openPodcast(show) {
   state.podcast = { name: show.name, feed_url: show.feed_url, artwork: show.artwork };
   state.page = 1;
@@ -455,7 +563,9 @@ async function loadEpisodes() {
       feed_url: state.podcast.feed_url, page: state.page, query: state.filter.trim() || undefined,
     });
     if (typeof data.page === "number") state.page = data.page;
+    if (data.artwork) state.podcast.artwork = state.podcast.artwork || data.artwork;
     showVideos(data, true);
+    renderFollows();
     $("#shorts-skip-note").textContent = "";
     hint.textContent = `Browsing “${state.podcast.name}” — click an episode to queue it, or use Queue all.`;
   } catch (err) {
@@ -474,6 +584,56 @@ async function queueWholePodcast() {
     if (!eps.length) { toast("Every episode is already downloaded or queued.", "notice"); return; }
     await queueVideos(eps, "episode");
   } catch (err) { toast(err.message, "error"); }
+}
+
+// ---------- music & any-site (resolved lists, paged locally) ----------
+
+async function resolveList(endpoint, body, label) {
+  hideResults();
+  setBusy(true, label);
+  try {
+    const data = await post(endpoint, body);
+    state.allVideos = data.videos || [];
+    state.page = 1;
+    state.filter = "";
+    $("#grid-filter").value = "";
+    pageResolved();
+    const hint = $("#scrape-hint");
+    if (data.kind === "playlist" && (data.album || data.title)) {
+      hint.textContent = `${data.album || data.title}${data.artist ? " — " + data.artist : ""} · `
+        + `${plural(state.allVideos.length, "item")}. Click to queue, or Queue all.`;
+    } else {
+      hint.textContent = MODES[state.mode].hint;
+    }
+  } catch (err) {
+    toast(err.message || String(err), "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function resolveMusic() {
+  const input = $("#channel-url").value.trim();
+  if (!input) { toast("Paste an album URL, or type an album to search.", "notice"); return; }
+  return resolveList("/api/music/resolve", { input }, input.includes("://") ? "Looking up…" : "Searching…");
+}
+
+function resolveWeb() {
+  const url = $("#channel-url").value.trim();
+  if (!url) { toast("Paste a link to a video or playlist.", "notice"); return; }
+  return resolveList("/api/web/resolve", { url }, "Looking up…");
+}
+
+function pageResolved() {
+  const q = state.filter.trim().toLowerCase();
+  const matches = q ? state.allVideos.filter((v) =>
+    `${v.title} ${v.artist || ""} ${v.album || ""} ${v.channel || ""}`.toLowerCase().includes(q)) : state.allVideos;
+  const totalPages = Math.max(1, Math.ceil(matches.length / 50));
+  state.page = Math.min(Math.max(1, state.page), totalPages);
+  const videos = matches.slice((state.page - 1) * 50, state.page * 50);
+  showVideos({ videos, page: state.page, total_pages: totalPages, count: videos.length, total: matches.length,
+    filtered: true }, true);
+  $("#shorts-skip-note").textContent = "";
 }
 
 // ---------- the grid ----------
@@ -547,14 +707,24 @@ function renderCard(v) {
     el("span", { class: "thumb-mark" }, [svgEl(ICONS.check)]),
     downloaded ? el("span", { class: "dl-badge" }, [svgEl(ICONS.check, 12), "In library"]) : null,
   ]));
-  const meta = [
-    v.upload_date ? fmtDate(v.upload_date) : "",
+  const meta = [cardDetail(v),
     downloaded ? "· downloaded" : (queued ? "· queued" : (v.view_count ? `· ${fmtViews(v.view_count)} views` : "")),
   ].filter(Boolean).join(" ");
   card.appendChild(el("div", { class: "card-body" }, [
     el("h3", { class: "card-title" }, v.title), el("div", { class: "card-meta" }, meta),
   ]));
   return card;
+}
+
+function cardDetail(v) {
+  if (state.mode === "music") {
+    const what = v.music_mode === "track"
+      ? (v.track ? `Track ${v.track}` : "Track")
+      : (v.chapters ? `Album · ${plural(v.chapters, "track")}` : "Album");
+    return [what, v.artist].filter(Boolean).join(" · ");
+  }
+  if (state.mode === "web" && v.site) return [v.site, v.channel].filter(Boolean).join(" · ");
+  return v.upload_date ? fmtDate(v.upload_date) : "";
 }
 
 function markCard(videoId, on) {
@@ -568,9 +738,14 @@ function updateSelectedCount() {
   $("#meta-selected").textContent = String(state.videos.filter((v) => state.queuedIds.has(v.video_id)).length);
 }
 
+const EXTRA_FIELDS = {
+  podcast: ["collection", "author", "artwork", "upload_date"],
+  music: ["artist", "album", "album_artist", "year", "track", "track_total", "music_mode"],
+};
+
 function videoPayload(v) {
   const p = { video_id: v.video_id, url: v.url, title: v.title, thumbnail: v.thumbnail, duration: v.duration };
-  if (v.collection) p.collection = v.collection;
+  for (const k of EXTRA_FIELDS[state.mode] || []) if (v[k] != null) p[k] = v[k];
   return p;
 }
 
@@ -605,7 +780,9 @@ async function toggleCard(videoId) {
 
 async function selectPage() {
   if (state.mode === "podcast") return queueWholePodcast();
-  const toAdd = state.videos.filter((v) => !state.queuedIds.has(v.video_id) && !v.downloaded);
+  // Music/any-site lists are fully known: queue all of them, not just this page.
+  const pool = state.mode === "music" || state.mode === "web" ? state.allVideos : state.videos;
+  const toAdd = pool.filter((v) => !state.queuedIds.has(v.video_id) && !v.downloaded);
   if (!toAdd.length) { toast("Nothing new to queue on this page.", "notice"); return; }
   try { await queueVideos(toAdd); } catch (err) { toast(err.message, "error"); }
 }
@@ -661,6 +838,16 @@ function renderQueueStats() {
   $("#stat-eta").textContent = s.eta != null ? fmtClock(s.eta) : "—";
 }
 
+function sourceChip(it) {
+  if (it.source === "podcast") return el("span", { class: "qchip qchip-pod" }, "Podcast");
+  if (it.source === "music") {
+    const mode = it.extra && it.extra.music_mode === "track" ? "Track" : "Album";
+    return el("span", { class: "qchip qchip-music" }, `${mode} · ${(it.quality || "").toUpperCase()}`);
+  }
+  if (it.source === "web") return el("span", { class: "qchip qchip-web" }, `Web · ${qualityLabel(it.quality)}`);
+  return el("span", { class: "qchip" }, qualityLabel(it.quality));
+}
+
 const STATUS_ICONS = {
   downloading: ICONS.download, completed: ICONS.check, failed: ICONS.alert, cancelled: ICONS.close,
 };
@@ -679,9 +866,7 @@ function renderQItem(it) {
       svgEl(STATUS_ICONS[it.status] || ICONS.clock, 12),
       el("em", { class: "status-verb" }, statusText(it)),
     ]),
-    it.source === "podcast"
-      ? el("span", { class: "qchip qchip-pod" }, "Podcast")
-      : el("span", { class: "qchip" }, qualityLabel(it.quality)),
+    sourceChip(it),
   ]);
   if (it.source !== "podcast" && it.status === "pending" && it.sponsorblock && it.sponsorblock.length) {
     meta.appendChild(el("span", { class: "qchip", title: it.sponsorblock.join(", ") },
@@ -775,9 +960,22 @@ function connectEvents() {
   src.onerror = () => { if (src.readyState !== EventSource.OPEN) setConn("reconnecting"); };
 }
 
+function announce(it) {
+  const title = it.title || it.video_id;
+  if (it.status === "completed") notify("Downloaded", title, it.id);
+  else if (it.status === "failed") notify("Download failed", `${title} — ${it.message || "see its log"}`, it.id);
+  const { remaining } = queueStats(state.queue);
+  if (state.remainingBefore > 0 && remaining === 0) {
+    const { done, failed } = queueStats(state.queue);
+    notify("Queue finished", `${plural(done, "download")} complete${failed ? `, ${failed} failed` : ""}.`, "queue");
+  }
+}
+
 function handleEvent(payload) {
+  state.remainingBefore = queueStats(state.queue).remaining;
   const r = applyQueueEvent(state.queue, payload);
   state.queue = r.queue;
+  updateTitle(state.queue);
   if (r.redraw === "all") {
     renderQueue();
     renderGrid();
@@ -788,6 +986,7 @@ function handleEvent(payload) {
       state.queuedIds = queuedVideoIds(state.queue);
       markCard(r.item.video_id, state.queuedIds.has(r.item.video_id));
       updateSelectedCount();
+      announce(r.item);
     }
   } else if (r.redraw === "removed") {
     for (const id of r.ids) { const row = byDataId(".qitem", id); if (row) row.remove(); }
@@ -807,6 +1006,13 @@ function handleEvent(payload) {
     case "settings":
       applySettingFields(payload);
       break;
+    case "library":
+      onLibraryChanged();
+      break;
+    case "notice":
+      toast(payload.message);
+      notify("Chive", payload.message, "notice");
+      break;
     case "disk":
       if (payload.low) {
         toast("Low disk space at the destination — downloads may stop.", "error");
@@ -814,6 +1020,49 @@ function handleEvent(payload) {
       }
       break;
   }
+}
+
+// ---------- views: Archive ⇄ Library ----------
+
+function setView(view, { focus = false } = {}) {
+  const library = view === "library";
+  $("#view-archive").hidden = library;
+  $("#view-library").hidden = !library;
+  for (const tab of document.querySelectorAll(".view-tabs [role=tab]")) {
+    const on = tab.dataset.view === view;
+    tab.classList.toggle("active", on);
+    tab.setAttribute("aria-selected", on ? "true" : "false");
+    tab.tabIndex = on ? 0 : -1;
+    if (on && focus) tab.focus();
+  }
+  if (library) showLibrary();
+  const hash = library ? "#library" : "";
+  if (location.hash !== hash) history.replaceState(null, "", hash || location.pathname);
+}
+
+function bindViews() {
+  const tabs = Array.from(document.querySelectorAll(".view-tabs [role=tab]"));
+  tabs.forEach((tab, ix) => {
+    tab.addEventListener("click", () => setView(tab.dataset.view));
+    tab.addEventListener("keydown", (e) => {
+      const delta = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      if (!delta) return;
+      e.preventDefault();
+      setView(tabs[(ix + delta + tabs.length) % tabs.length].dataset.view, { focus: true });
+    });
+  });
+  window.addEventListener("hashchange", () => setView(location.hash === "#library" ? "library" : "archive"));
+  // "/" jumps to the search box of the current view (unless you're typing).
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+    const tag = (e.target && e.target.tagName) || "";
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(tag) || e.target.isContentEditable) return;
+    if (document.querySelector(".modal-overlay:not([hidden])")) return;
+    e.preventDefault();
+    if ($("#view-library").hidden) $("#channel-url").focus();
+    else focusLibrarySearch();
+  });
+  setView(location.hash === "#library" ? "library" : "archive");
 }
 
 // ---------- theme (Dusk ⇄ Dawn) ----------
@@ -924,6 +1173,22 @@ function bindSettings() {
     if (v) saveSettings({ download_dir: v }, "Destination updated.");
   });
   $("#update-ytdlp").addEventListener("click", updateYtdlp);
+  $("#music-keep-full").addEventListener("change", (e) => saveSettings({ music_keep_full: e.target.checked }));
+  $("#sync-hours").addEventListener("change", (e) => saveSettings({ podcast_sync_hours: Number(e.target.value) }));
+}
+
+function bindFollows() {
+  $("#follow-btn").addEventListener("click", () => {
+    if (!state.podcast) return;
+    const on = state.follows.some((f) => f.feed_url === state.podcast.feed_url);
+    setFollow(state.podcast, !on);
+  });
+  $("#sync-all").addEventListener("click", () => syncFollows());
+  $("#opml-file").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) importOpml(file);
+    e.target.value = "";
+  });
 }
 
 function bindQueue() {
@@ -937,9 +1202,13 @@ async function init() {
   document.documentElement.dataset.mode = state.mode;
   initModals();
   initLogViewer();
+  initLibrary();
+  initNotifications();
   bindSource();
   bindSettings();
+  bindFollows();
   bindQueue();
+  bindViews();
   initEasterEggs();
   freshEmptyLine();
   try { applySettings(await api("/api/settings")); } catch (err) { toast("Could not load settings.", "error"); }

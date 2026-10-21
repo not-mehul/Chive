@@ -16,6 +16,7 @@ import sys
 from chive import __version__, config, ytdlp
 from chive.api import allowed_hosts_for, create_app
 from chive.manager import QueueManager
+from chive.subscriptions import AutoSync
 
 
 def _banner(host: str, port: int) -> None:
@@ -43,6 +44,7 @@ def main() -> None:
     manager = QueueManager()
     app = create_app(manager, allowed_hosts_for(host, config.env("ALLOWED_HOSTS")))
     _banner(host, port)
+    AutoSync(manager).start()     # checks followed podcasts when enabled in Settings
 
     # Stop running downloads on every exit path. They run in their own process
     # group, so they don't receive the console's Ctrl+C and would otherwise

@@ -25,4 +25,4 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E731", "SIM117"]
+"tests/*" = ["E731", "SIM117", "E501"]  # long assertions read better unwrapped

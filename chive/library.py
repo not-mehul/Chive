@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 _IN_PROGRESS_SUFFIXES = (".part", ".ytdl", ".temp")
-_VIDEO_ID_RE = re.compile(r"\[([0-9A-Za-z_-]{11})\]")
-_POD_TAG_RE = re.compile(r"\[([0-9a-f]{8})\]$")
+VIDEO_ID_RE = re.compile(r"\[([0-9A-Za-z_-]{11})\]")
+POD_TAG_RE = re.compile(r"\[([0-9a-f]{8})\]$")
 # Unsafe on some filesystem, plus `%` (yt-dlp output-template syntax).
 _FS_BAD = re.compile(r'[<>:"/\\|?*%\x00-\x1f]')
 
@@ -52,7 +52,7 @@ def scan_video_ids(folder: Path) -> set[str]:
     """YouTube ids of finished downloads anywhere under `folder`."""
     ids: set[str] = set()
     for p in _finished_files(folder, recursive=True):
-        m = _VIDEO_ID_RE.search(p.name)
+        m = VIDEO_ID_RE.search(p.name)
         if m:
             ids.add(m.group(1))
     return ids
@@ -75,7 +75,7 @@ def podcast_downloaded(folder: Path, episodes: list[dict[str, Any]]) -> set[str]
     stems: set[str] = set()
     for p in _finished_files(folder, recursive=False):
         stems.add(p.stem)
-        m = _POD_TAG_RE.search(p.stem)
+        m = POD_TAG_RE.search(p.stem)
         if m:
             tags.add(m.group(1))
     have: set[str] = set()

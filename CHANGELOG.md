@@ -5,12 +5,35 @@ All notable changes to Chive are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Library view** — browse everything archived (indexed metadata merged with
+  a scan of the download folder), search, filter by source, sort, play in the
+  browser with seeking, save a copy, and delete (with subtitles/thumbnails and
+  the download-archive entry).
+- **Music** — album/playlist URLs (YouTube Music, Bandcamp, SoundCloud…) or
+  album search. Full-album uploads are split by chapter into `NN - Title`
+  tracks, each tagged (title, track n/N, album, artist, album artist, year)
+  with square cover art; MP3 or M4A; optional "keep the full album".
+- **Any site** — generic URL mode for anything yt-dlp supports, saved under
+  `Web/<site>/<uploader>/`.
+- **Podcast extras** — real episode tags and artwork from the feed; follow
+  shows and check for new episodes on demand or every 1–24 hours; OPML import
+  and export; local RSS feeds of archived shows for podcast apps.
+- **Desktop notifications** (opt-in) for finished/failed downloads, a drained
+  queue and new podcast episodes; download progress in the tab title.
+- Self-hosted fonts — the page makes no third-party font requests.
+- `/` focuses search; Archive/Library tabs (with `#library` links); reduced
+  motion respected throughout.
+
 ### Security
 - **Request guard**: the API now only obeys its own page. Requests must be
   addressed to a loopback host (blocks DNS rebinding), and state-changing
   requests must be JSON without a foreign `Origin` (blocks other websites from
   queueing downloads, changing settings or running the yt-dlp updater).
   `CHIVE_ALLOWED_HOSTS` adds hostnames for LAN setups.
+- Library file access and deletion are confined to the download folder
+  (paths re-validated on every request, symlinks out of it refused); request
+  bodies are capped at 8 MB; OPML with DOCTYPE/ENTITY declarations is refused.
 
 ### Changed
 - **Whole-item progress**: a video+audio download now reports one progress
@@ -35,9 +58,10 @@ All notable changes to Chive are documented here. This project adheres to
   lists now come from the server instead of being duplicated in JS.
 - Removed dead code: unused stats/cancel-all paths, a pass-through helper,
   unused CSS rules and the retired amber colour tokens.
-- Tests: 128 Python (unit, API, real-process lifecycle, offline real
-  downloads), 18 JS unit tests, and a browser end-to-end smoke test; ruff
-  lint. CI runs all of it on Linux and Windows.
+- Tests: Python unit, API, real-process lifecycle and offline real-download
+  tests (including real ffmpeg album splitting and tagging), JS unit tests,
+  and a browser end-to-end test covering download → library → play → delete;
+  ruff lint. CI runs all of it on Linux and Windows.
 
 ### Fixed
 - **Live updates under waitress**: the event stream sent a hop-by-hop

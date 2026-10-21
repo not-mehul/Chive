@@ -75,6 +75,42 @@ def _sb_categories(v: Any) -> list[str]:
     return sorted({c for c in v if c in config.SPONSORBLOCK_CATEGORIES})
 
 
+def _music_format(v: Any) -> str:
+    if v not in config.MUSIC_FORMATS:
+        raise _Skip
+    return v
+
+
+def _sync_hours(v: Any) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ValueError("podcast_sync_hours must be an integer") from None
+    if n not in config.PODCAST_SYNC_CHOICES:
+        raise ValueError(f"podcast_sync_hours must be one of {config.PODCAST_SYNC_CHOICES}")
+    return n
+
+
+def _follows(v: Any) -> list[dict[str, Any]]:
+    """Followed podcasts: [{feed_url, name, artwork, since}] — deduped by feed."""
+    if not isinstance(v, list):
+        raise _Skip
+    out: dict[str, dict[str, Any]] = {}
+    for f in v:
+        if not isinstance(f, dict):
+            continue
+        feed = f.get("feed_url")
+        if not isinstance(feed, str) or not feed.startswith(("http://", "https://")):
+            continue
+        out[feed] = {
+            "feed_url": feed,
+            "name": str(f.get("name") or feed)[:200],
+            "artwork": f.get("artwork") if isinstance(f.get("artwork"), str) else None,
+            "since": str(f.get("since") or "")[:8],
+        }
+    return list(out.values())
+
+
 def _sb_mode(v: Any) -> str:
     if v not in config.SPONSORBLOCK_MODES:
         raise _Skip
@@ -98,10 +134,16 @@ _RULES: dict[str, Callable[[Any], Any]] = {
     "last_quality": _quality,
     "last_sponsorblock": _sb_categories,
     "last_sb_mode": _sb_mode,
+    "music_format": _music_format,
+    "music_keep_full": _bool,
+    "podcast_sync_hours": _sync_hours,
+    "podcast_follows": _follows,
+    "podcast_last_sync": lambda v: float(v),
 }
 
-# Settings the API may change. History is only ever appended by a scrape.
-API_FIELDS = frozenset(_RULES) - {"history"}
+# Settings the API may change directly. History is appended by scrapes and
+# follows are managed through the podcast follow/unfollow/import endpoints.
+API_FIELDS = frozenset(_RULES) - {"history", "podcast_follows", "podcast_last_sync"}
 
 
 @dataclass
@@ -122,6 +164,11 @@ class Settings:
     last_quality: str = config.DEFAULT_QUALITY
     last_sponsorblock: list[str] = field(default_factory=lambda: ["selfpromo", "sponsor"])
     last_sb_mode: str = "remove"
+    music_format: str = config.DEFAULT_MUSIC_FORMAT
+    music_keep_full: bool = False      # keep the unsplit album file too
+    podcast_sync_hours: int = 0        # auto-check followed shows (0 = off)
+    podcast_follows: list[dict[str, Any]] = field(default_factory=list)
+    podcast_last_sync: float = 0.0     # epoch seconds of the last auto-check
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Settings:
@@ -172,12 +219,13 @@ class Settings:
 
     def copy(self) -> Settings:
         return replace(self, history=list(self.history),
-                       last_sponsorblock=list(self.last_sponsorblock))
+                       last_sponsorblock=list(self.last_sponsorblock),
+                       podcast_follows=[dict(f) for f in self.podcast_follows])
 
 
 def _jsonable(v: Any) -> Any:
     if isinstance(v, Path):
         return str(v)
     if isinstance(v, list):
-        return list(v)
+        return [dict(x) if isinstance(x, dict) else x for x in v]
     return v

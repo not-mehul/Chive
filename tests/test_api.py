@@ -61,6 +61,12 @@ class ErrorTests(ApiTestCase):
         self.assertEqual(r.status_code, 404)
         self.assertIn("error", r.get_json())
 
+    def test_oversized_body_is_refused(self):
+        r = self.client.post("/api/podcast/opml", data=b"x" * (api.MAX_REQUEST_BYTES + 1),
+                             content_type="application/json")
+        self.assertEqual(r.status_code, 413)
+        self.assertIn("error", r.get_json())
+
     def test_unexpected_exception_is_json(self):
         with mock.patch.object(self.m, "snapshot", side_effect=RuntimeError("kaboom")), \
                 self.assertLogs(self.app.logger, "ERROR"):        # logged, not swallowed

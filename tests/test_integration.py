@@ -1,11 +1,13 @@
 """Real downloads through chive/ytdlp_runner.py and real yt-dlp — offline, from
 a local HTTP server. Skipped when the yt_dlp module isn't installed."""
 
+import json
+import subprocess
 import unittest
 from unittest import mock
 
 import support
-from support import MediaServer, make_manager, status_of, wait_for
+from support import HAS_FFMPEG, MediaServer, make_audio, make_image, make_manager, probe, status_of, wait_for
 
 from chive import ytdlp
 
@@ -27,11 +29,13 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.addCleanup(self.m.shutdown)
 
     def _download(self, vid, title, url=None, extra=()):
-        (it,) = self.m.add([{"video_id": vid, "url": url or self.url, "title": title,
-                             "collection": "Show"}], None, [], source="podcast")
         real = self.m.build_command
+        # Patch *before* queueing: once the queue is running, the dispatcher
+        # may start the new item immediately.
         with mock.patch.object(self.m, "build_command",
                                side_effect=lambda i: real(i)[:-1] + list(extra) + [i.url]):
+            (it,) = self.m.add([{"video_id": vid, "url": url or self.url, "title": title,
+                                 "collection": "Show"}], None, [], source="podcast")
             self.m.start()
             wait_for(lambda: status_of(self.m, it.id) in ("completed", "failed"), timeout=60)
         return self.m.item(it.id)
@@ -84,6 +88,73 @@ class RunnerIntegrationTests(unittest.TestCase):
         log = restarted.get_log(it.id)
         self.assertTrue(any("Resuming download at byte" in ln for ln in log), "\n".join(log))
         self.assertTrue(any("resuming: Slow" in ln for ln in log))
+
+
+@unittest.skipUnless(ytdlp.runner_cmd() and HAS_FFMPEG, "needs the yt_dlp module and ffmpeg")
+class MusicIntegrationTests(unittest.TestCase):
+    """Real music downloads through yt-dlp + the runner's tagger/splitter."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.media = MediaServer()
+        d = support.tmpdir()
+        cls.album_url = cls.media.add("album.mp3", 1)
+        cls.media.files["album.mp3"] = make_audio(d / "album.mp3", 30).read_bytes()
+        cls.cover_url = cls.media.add("thumb.png", 1)
+        cls.media.files["thumb.png"] = make_image(d / "thumb.png").read_bytes()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.media.close()
+
+    def test_full_album_is_split_into_tagged_tracks(self):
+        """yt-dlp only learns chapters from a real site, so feed it an info JSON
+        (as a site extractor would produce) via --load-info-json."""
+        d = support.tmpdir()
+        info = d / "album.info.json"
+        info.write_text(json.dumps({
+            "id": "albumvid001", "title": "Band - Allium (Full Album)", "uploader": "Band - Topic",
+            "url": self.album_url, "ext": "mp3", "extractor": "generic", "extractor_key": "Generic",
+            "webpage_url": self.album_url, "duration": 30, "thumbnail": self.cover_url,
+            "chapters": [{"start_time": 0, "end_time": 10, "title": "01. Shoots"},
+                         {"start_time": 10, "end_time": 20, "title": "Band - Bulbs (Official Audio)"},
+                         {"start_time": 20, "end_time": 30, "title": "Blossom"}]}))
+        folder = d / "Music" / "Band" / "Allium"
+        tags = {"mode": "album", "artist": "Band", "album": "Allium", "album_artist": "Band", "date": "2024",
+                "square": True, "cover_save": str(folder / "cover.jpg")}
+        out = subprocess.run(
+            [*ytdlp.runner_cmd(), "--load-info-json", str(info), "--newline", "--no-colors",
+             "-o", str(folder / "Allium.%(ext)s"), "--no-quiet", "--chive-tags", json.dumps(tags)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        reported = [json.loads(ln[8:]) for ln in out.stdout.splitlines() if ln.startswith("[YTFILE]")]
+        self.assertEqual([f["title"] for f in reported], ["Shoots", "Bulbs", "Blossom"])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["01 - Shoots.mp3", "02 - Bulbs.mp3", "03 - Blossom.mp3", "cover.jpg"])
+        p = probe(folder / "02 - Bulbs.mp3")
+        self.assertEqual((p["tags"]["title"], p["tags"]["track"], p["tags"]["album"], p["tags"]["artist"],
+                          p["tags"]["date"]), ("Bulbs", "2/3", "Allium", "Band", "2024"))
+        self.assertIn(("video", "mjpeg", 1), p["streams"])
+
+    def test_queued_track_is_tagged_and_lands_in_the_library(self):
+        m = make_manager(start_dispatcher=True)
+        self.addCleanup(m.shutdown)
+        (it,) = m.add([{"video_id": "t1", "url": self.album_url, "title": "Green Shoots",
+                        "thumbnail": self.cover_url, "artist": "The Chives", "album": "Allium",
+                        "year": "2024", "track": 3, "track_total": 9, "music_mode": "track"}],
+                      None, [], source="music")
+        m.start()
+        wait_for(lambda: status_of(m, it.id) in ("completed", "failed"), timeout=60)
+        item = m.item(it.id)
+        self.assertEqual(item["status"], "completed", item["message"])
+        path = m.download_dir / "Music" / "The Chives" / "Allium" / "03 - Green Shoots.mp3"
+        self.assertEqual(item["output_file"], str(path))
+        tags = probe(path)["tags"]
+        self.assertEqual((tags["title"], tags["track"], tags["album"]), ("Green Shoots", "3/9", "Allium"))
+        lib = m.library.get("Music/The Chives/Allium/03 - Green Shoots.mp3")
+        self.assertEqual((lib["source"], lib["video_id"], lib["artist"]), ("music", "t1", "The Chives"))
+        log = m.get_log(it.id)
+        self.assertIn("[postprocess] ChiveFinish", log)
 
 
 if __name__ == "__main__":

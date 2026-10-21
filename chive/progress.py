@@ -12,6 +12,7 @@ file path, errors, and archive/already-downloaded detection.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -26,8 +27,8 @@ PROGRESS_TEMPLATE = (
 )
 
 # What apply_line() reports about a line.
-PROGRESS, POSTPROCESS, ARCHIVED, ON_DISK, OTHER = (
-    "progress", "postprocess", "archived", "on_disk", "other")
+PROGRESS, POSTPROCESS, ARCHIVED, ON_DISK, FILE, OTHER = (
+    "progress", "postprocess", "archived", "on_disk", "file", "other")
 
 AGE_RESTRICTED = "Age-restricted — add cookies under Settings → Access & throughput"
 
@@ -55,7 +56,7 @@ _PHASE_MARKERS = (
 INDETERMINATE_PHASES = frozenset({
     "Querying SponsorBlock", "Merging streams", "Extracting audio",
     "Embedding thumbnail", "Embedding subtitles", "Writing metadata",
-    "Writing chapters", "Cutting segments", "Processing",
+    "Writing chapters", "Cutting segments", "Processing", "Tagging", "Splitting tracks",
 })
 
 
@@ -88,6 +89,8 @@ def pp_phase(name: str) -> str:
     """Postprocessor class name → the phase shown to the user."""
     n = (name or "").lower()
     for needle, phase in (
+        ("chivesplit", "Splitting tracks"),
+        ("chivefinish", "Tagging"),
         ("merger", "Merging streams"),
         ("modifychapters", "Cutting segments"),
         ("sponsorblock", "Cutting segments"),
@@ -133,6 +136,20 @@ def _apply_progress(item: QueueItem, line: str) -> None:
     item.message = _ext_kind(ext)
 
 
+def _apply_file(item: QueueItem, payload: str) -> None:
+    """A finished file from the runner (one per track for a split album)."""
+    try:
+        f = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(f, dict) or not f.get("path"):
+        return
+    files = item.extra.setdefault("files", [])
+    files.append(f)
+    # One file → that file; several (album tracks) → their folder.
+    item.output_file = f["path"] if len(files) == 1 else str(Path(f["path"]).parent)
+
+
 def apply_line(item: QueueItem, line: str) -> str:
     """Update `item` from one output line; returns what kind of line it was."""
     line = line.rstrip("\r")
@@ -142,6 +159,9 @@ def apply_line(item: QueueItem, line: str) -> str:
     if "[YTPROG]" in line:
         _apply_progress(item, line)
         return PROGRESS
+    if line.startswith("[YTFILE]"):
+        _apply_file(item, line[8:].strip())
+        return FILE
     if "has already been recorded in the archive" in line:
         return ARCHIVED
     if "has already been downloaded" in line:
@@ -155,7 +175,8 @@ def apply_line(item: QueueItem, line: str) -> str:
         return OTHER
     fp = _FILEPATH_RE.match(line)
     if fp:
-        item.output_file = fp.group(1).strip()
+        if not item.extra.get("files"):     # runner [YTFILE] lines are authoritative
+            item.output_file = fp.group(1).strip()
         return OTHER
     for marker, phase in _PHASE_MARKERS:
         if marker in line:

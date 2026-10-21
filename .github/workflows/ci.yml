@@ -41,6 +41,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Install ffmpeg (Linux)
+        # Tagging/album-splitting tests use real ffmpeg; they skip where it's absent.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Unit + integration tests
         # Integration tests download from a local HTTP server — no internet needed.
         run: python -W error::ResourceWarning -m unittest discover -s tests -v
@@ -70,6 +74,7 @@ jobs:
           node-version: "22"
       - name: Install
         run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install -r requirements.txt
           npm install
           npx playwright install --with-deps chromium

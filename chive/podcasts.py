@@ -116,6 +116,7 @@ def parse_feed(raw: bytes) -> dict[str, Any]:
     if channel is None:
         raise RuntimeError("that doesn't look like a podcast RSS feed")
     show = (channel.findtext("title") or "").strip() or "Podcast"
+    show_author = (channel.findtext(f"{{{_ITUNES_NS}}}author") or "").strip() or None
     artwork = (channel.findtext("image/url") or "").strip() or None
     if not artwork:
         it_img = channel.find(f"{{{_ITUNES_NS}}}image")
@@ -135,12 +136,14 @@ def parse_feed(raw: bytes) -> dict[str, Any]:
             "duration": parse_duration(item.findtext(f"{{{_ITUNES_NS}}}duration")),
             "upload_date": rss_date(item.findtext("pubDate")),
             "collection": show,
+            "author": (item.findtext(f"{{{_ITUNES_NS}}}author") or "").strip() or show_author,
+            "artwork": artwork,
         })
-    return {"podcast": show, "artwork": artwork, "episodes": episodes}
+    return {"podcast": show, "author": show_author, "artwork": artwork, "episodes": episodes}
 
 
-def load_feed(feed_url: str) -> dict[str, Any]:
-    cached = FEED_CACHE.get(feed_url)
+def load_feed(feed_url: str, fresh: bool = False) -> dict[str, Any]:
+    cached = None if fresh else FEED_CACHE.get(feed_url)
     if cached is not None:
         return cached
     try:
@@ -166,7 +169,29 @@ def fetch_episodes(feed_url: str, page: int, page_size: int = config.PODCAST_PAG
     page = max(1, min(page, total_pages))
     window = [dict(v) for v in episodes[(page - 1) * page_size: page * page_size]]
     return {
-        "podcast": feed["podcast"], "artwork": feed["artwork"], "feed_url": feed_url,
+        "podcast": feed["podcast"], "author": feed.get("author"), "artwork": feed["artwork"],
+        "feed_url": feed_url,
         "videos": window, "page": page, "page_size": page_size, "count": len(window),
         "total": total, "total_pages": total_pages, "source": "podcast",
     }
+
+
+def _text(v: Any, limit: int = 300) -> str | None:
+    return str(v).strip()[:limit] if v not in (None, "") else None
+
+
+def item_extra(v: dict[str, Any]) -> dict[str, Any]:
+    """Validated episode metadata for a queued card → QueueItem.extra: real
+    tags (show, author, date, artwork) for the tagger, instead of whatever the
+    generic extractor guesses from the audio URL."""
+    show = _text(v.get("collection")) or "Podcasts"
+    author = _text(v.get("author"))
+    date = _text(v.get("upload_date"), 8) or ""
+    tags = {
+        "title": _text(v.get("title")), "album": show, "artist": author or show,
+        "album_artist": author or show, "genre": "Podcast",
+        "date": f"{date[:4]}-{date[4:6]}-{date[6:8]}" if len(date) == 8 and date.isdigit() else None,
+    }
+    artwork = v.get("artwork") if isinstance(v.get("artwork"), str) else None
+    return {"tags": {k: val for k, val in tags.items() if val}, "artwork": artwork,
+            "upload_date": date or None}

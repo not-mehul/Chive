@@ -20,8 +20,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import IO, Any
 
-from . import commands, config, library, progress
-from .models import FINISHED_STATUSES, QueueItem
+from . import catalog, commands, config, library, music, podcasts, progress
+from .models import FINISHED_STATUSES, SOURCES, QueueItem
 from .settings import Settings
 from .util import (
     atomic_write_json,
@@ -42,9 +42,12 @@ _SAFE_ID_RE = re.compile(r"[\w-]{1,80}")
 class QueueManager:
     def __init__(self, state_file: Path = config.STATE_FILE,
                  item_log_dir: Path = config.ITEM_LOG_DIR,
-                 start_dispatcher: bool = True) -> None:
+                 start_dispatcher: bool = True,
+                 library_file: Path | None = None) -> None:
         self.state_file = state_file
         self.item_log_dir = item_log_dir
+        # The library index lives next to the state file.
+        self.library = catalog.LibraryIndex(library_file or state_file.with_name("library.json"))
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()   # snapshot+write as one step
         self._wake = threading.Event()
@@ -145,13 +148,18 @@ class QueueManager:
     def add(self, videos: list[dict[str, Any]], quality: str | None,
             sponsorblock: list[str], sb_mode: str = "remove",
             source: str = "youtube") -> list[QueueItem]:
-        source = "podcast" if source == "podcast" else "youtube"
+        source = source if source in SOURCES else "youtube"
+        clean_sb: list[str] = []
         if source == "podcast":
-            quality, clean_sb = config.PODCAST_QUALITY, []
+            quality = config.PODCAST_QUALITY
+        elif source == "music":
+            # The music format is fixed at queue time, like a video preset.
+            quality = self.settings_copy().music_format
         else:
             if quality not in config.QUALITY_PRESETS:
                 raise ValueError(f"unknown quality preset: {quality}")
-            clean_sb = [c for c in sponsorblock or [] if c in config.SPONSORBLOCK_CATEGORIES]
+            if source == "youtube":
+                clean_sb = [c for c in sponsorblock or [] if c in config.SPONSORBLOCK_CATEGORIES]
         sb_mode = sb_mode if sb_mode in config.SPONSORBLOCK_MODES else "remove"
         added: list[QueueItem] = []
         with self._lock:
@@ -167,14 +175,22 @@ class QueueManager:
                     continue
                 url = v.get("url") or (f"https://www.youtube.com/watch?v={vid}"
                                        if source == "youtube" else None)
-                if not url:
+                if not url or not isinstance(url, str):
                     continue
+                extra: dict[str, Any] = {}
+                collection = None
+                if source == "podcast":
+                    extra = podcasts.item_extra(v)
+                    collection = extra["tags"]["album"]
+                elif source == "music":
+                    extra = music.item_extra(v)
+                    collection = extra["tags"]["album"]
                 item = QueueItem(
                     id=str(uuid.uuid4()), video_id=vid, url=url,
                     title=v.get("title") or vid, thumbnail=v.get("thumbnail"),
                     duration=v.get("duration"), quality=quality,
                     sponsorblock=clean_sb, sponsorblock_mode=sb_mode, source=source,
-                    collection=v.get("collection") if source == "podcast" else None,
+                    collection=collection, extra=extra,
                 )
                 self._items[item.id] = item
                 self._order.append(item.id)
@@ -316,7 +332,7 @@ class QueueManager:
             disk = library.scan_video_ids(folder)
             with self._lock:
                 self._dl_scan = {"dir": folder, "ts": time.time(), "ids": disk}
-        return ids | disk | library.archive_ids(folder)
+        return ids | disk | library.archive_ids(folder) | self.library.ids()
 
     def podcast_downloaded(self, collection: str, episodes: list[dict[str, Any]]) -> set[str]:
         folder = self.download_dir / library.safe_segment(collection or "Podcasts")
@@ -417,6 +433,16 @@ class QueueManager:
         with self._listeners_lock:
             self._listeners.append(q)
         return q
+
+    def library_changed(self) -> None:
+        """Files were added/removed outside a download (e.g. a library delete)."""
+        with self._lock:
+            self._dl_scan = None
+        self._broadcast({"type": "library"})
+
+    def notify(self, message: str) -> None:
+        """A user-facing notice (toast / desktop notification in the UI)."""
+        self._broadcast({"type": "notice", "message": message})
 
     def drop(self, q: queue.Queue[str]) -> None:
         with self._listeners_lock:
@@ -623,17 +649,34 @@ class QueueManager:
             item.reset_transfer()
             if status == "completed":
                 item.progress = 100.0
-                if item.output_file:     # real size beats the estimate
-                    try:
-                        item.total_bytes = float(Path(item.output_file).stat().st_size)
-                    except OSError:
-                        pass
+                size = _files_size(item)     # real size beats the estimate
+                if size:
+                    item.total_bytes = size
                 if item.total_bytes:
                     item.downloaded_bytes = item.total_bytes
                 self._dl_scan = None     # the library just changed
             snap = asdict(item)
+            root = self._settings.download_dir
+        if status == "completed" and self._record_in_library(item, root):
+            self._broadcast({"type": "library"})
         self._broadcast({"type": "update", "item": snap})
         self._persist()
+
+    def _record_in_library(self, item: QueueItem, root: Path) -> bool:
+        files = [f for f in item.extra.get("files") or [] if Path(f.get("path", "")).is_file()]
+        if not files and item.output_file and Path(item.output_file).is_file():
+            files = [{"path": item.output_file, "title": item.title}]
+        if not files:
+            return False
+        tags = item.extra.get("tags") or {}
+        meta = {
+            "source": item.source, "video_id": item.video_id, "url": item.url,
+            "collection": item.collection or tags.get("album"),
+            "artist": tags.get("artist"), "thumbnail": item.thumbnail,
+            "date": tags.get("date") or item.extra.get("upload_date"),
+            "title": item.title, "duration": item.duration,
+        }
+        return bool(self.library.record(root, files, meta))
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """Stop every running download before the server exits. Downloads run
@@ -655,3 +698,15 @@ class QueueManager:
             except subprocess.TimeoutExpired:
                 force_kill(proc)
         self._persist()
+
+
+def _files_size(item: QueueItem) -> float | None:
+    """Bytes on disk for a finished item: its file, or all its album tracks."""
+    paths = [f.get("path") for f in item.extra.get("files") or []] or [item.output_file]
+    total = 0.0
+    for p in paths:
+        try:
+            total += Path(p).stat().st_size if p and Path(p).is_file() else 0
+        except OSError:
+            pass
+    return total or None

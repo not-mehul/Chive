@@ -3,7 +3,7 @@
 import { $, el, toast } from "./dom.js";
 
 /** Purple-pompom confetti, as if a chive flower went to seed. */
-export function blossomBurst(n = 28) {
+function blossomBurst(n = 28) {
   if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   const layer = el("div", { class: "blossom-layer", "aria-hidden": "true" });
   document.body.appendChild(layer);

@@ -10,9 +10,8 @@ from typing import Any
 from . import config
 
 STATUSES = ("pending", "downloading", "paused", "completed", "failed", "cancelled")
-ACTIVE_STATUSES = frozenset({"pending", "downloading", "paused"})
 FINISHED_STATUSES = frozenset({"completed", "failed", "cancelled"})
-SOURCES = ("youtube", "podcast")
+SOURCES = ("youtube", "podcast", "music", "web")
 
 
 @dataclass
@@ -26,8 +25,8 @@ class QueueItem:
     quality: str
     sponsorblock: list[str]
     sponsorblock_mode: str = "remove"
-    source: str = "youtube"            # youtube | podcast
-    collection: str | None = None      # podcast/show name → destination subfolder
+    source: str = "youtube"            # youtube | podcast | music | web
+    collection: str | None = None      # show / album name → destination subfolder
     status: str = "pending"
     progress: float = 0.0
     speed: str | None = None
@@ -42,6 +41,9 @@ class QueueItem:
     added_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    # Source-specific data: "tags" (written by the tagger), "music_mode"
+    # (album | track), "files" (finished files reported by the runner), …
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def reset_transfer(self) -> None:
         """Clear the live transfer readouts (speed / eta / rate)."""
@@ -53,7 +55,7 @@ class QueueItem:
     def from_dict(cls, raw: dict[str, Any], default_quality: str) -> QueueItem:
         """Rebuild an item from persisted state, validating every field.
         Raises KeyError/TypeError/ValueError for an unusable record."""
-        source = "podcast" if raw.get("source") == "podcast" else "youtube"
+        source = raw.get("source") if raw.get("source") in SOURCES else "youtube"
         mode = raw.get("sponsorblock_mode")
         status = raw.get("status")
         item = cls(
@@ -81,6 +83,7 @@ class QueueItem:
             added_at=float(raw.get("added_at") or time.time()),
             started_at=raw.get("started_at"),
             finished_at=raw.get("finished_at"),
+            extra=raw.get("extra") if isinstance(raw.get("extra"), dict) else {},
         )
         # A download interrupted by a shutdown comes back as pending; it
         # resumes from its .part file when the queue next runs.

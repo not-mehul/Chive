@@ -10,7 +10,7 @@ function focusables(overlay) {
   return Array.from(overlay.querySelectorAll(FOCUSABLE)).filter((n) => n.offsetParent !== null);
 }
 
-export function isOpen(overlay) {
+function isOpen(overlay) {
   return stack.some((m) => m.overlay === overlay);
 }
 
@@ -40,7 +40,7 @@ export function closeModal(overlay) {
   if (entry.returnTo && document.contains(entry.returnTo)) entry.returnTo.focus({ preventScroll: true });
 }
 
-export function closeTopModal() {
+function closeTopModal() {
   if (stack.length) closeModal(stack[stack.length - 1].overlay);
 }
 

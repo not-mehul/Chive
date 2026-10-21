@@ -39,6 +39,9 @@ export const ICONS = {
   alert: `<circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h0"/>`,
   clock: `<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>`,
   search: `<circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/>`,
+  note: `<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>`,
+  save: `<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>`,
+  trash: `<path d="M3 6h18M8 6V4h8v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6"/>`,
 };
 
 /** Find an element by a data-id, safely escaping arbitrary ids (podcast

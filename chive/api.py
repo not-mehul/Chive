@@ -22,10 +22,22 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from . import __version__, config, podcasts, progress, youtube, ytdlp
+from . import (
+    __version__,
+    catalog,
+    config,
+    feeds,
+    music,
+    podcasts,
+    progress,
+    subscriptions,
+    web,
+    youtube,
+    ytdlp,
+)
 from .manager import QueueManager
 from .settings import API_FIELDS
 from .util import disk_free, disk_total, reveal_path
@@ -37,6 +49,7 @@ mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("text/css", ".css")
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
@@ -82,6 +95,8 @@ def _error(message: str, status: int):
 def create_app(manager: QueueManager,
                allowed_hosts: frozenset[str] | None = LOOPBACK_HOSTS) -> Flask:
     app = Flask(__name__, static_folder=str(config.STATIC_DIR), static_url_path="/static")
+    # Requests are small JSON documents (the largest: an OPML import).
+    app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
     # ----- guard & errors ----------------------------------------------------
 
@@ -209,10 +224,129 @@ def create_app(manager: QueueManager,
                 query=(data.get("query") or "").strip() or None)
         except RuntimeError as exc:
             return _error(str(exc), 502)
-        have = manager.podcast_downloaded(result["podcast"], result["videos"])
+        have = manager.podcast_downloaded(result["podcast"], result["videos"]) | manager.library.ids()
         for v in result["videos"]:
             v["downloaded"] = v["video_id"] in have
+        result["followed"] = any(f["feed_url"] == feed for f in subscriptions.follows(manager))
         return jsonify(result)
+
+    def _resolved(resolver, text):
+        try:
+            result = resolver(text)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        except RuntimeError as exc:
+            return _error(str(exc), 502)
+        have = manager.downloaded_ids()
+        for v in result["videos"]:
+            v["downloaded"] = v.get("video_id") in have
+        return jsonify(result)
+
+    @app.post("/api/music/resolve")
+    def api_music_resolve():
+        return _resolved(music.resolve, _body().get("input") or "")
+
+    @app.post("/api/web/resolve")
+    def api_web_resolve():
+        return _resolved(web.resolve, _body().get("url") or "")
+
+    # ----- podcast follows ----------------------------------------------------
+
+    @app.get("/api/podcast/follows")
+    def api_follows():
+        return jsonify({"follows": subscriptions.follows(manager),
+                        "sync_hours": manager.settings_copy().podcast_sync_hours})
+
+    @app.post("/api/podcast/follow")
+    def api_follow():
+        data = _body()
+        try:
+            follows = subscriptions.follow(manager, data.get("feed_url") or "",
+                                           data.get("name"), data.get("artwork"))
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        return jsonify({"follows": follows})
+
+    @app.post("/api/podcast/unfollow")
+    def api_unfollow():
+        return jsonify({"follows": subscriptions.unfollow(manager, _body().get("feed_url") or "")})
+
+    @app.post("/api/podcast/sync")
+    def api_sync():
+        result = subscriptions.sync(manager, _body().get("feed_url"))
+        if result["added"]:
+            manager.start()
+        return jsonify(result)
+
+    @app.get("/api/podcast/opml")
+    def api_opml_export():
+        return Response(subscriptions.export_opml(manager), mimetype="text/x-opml",
+                        headers={"Content-Disposition": 'attachment; filename="chive-podcasts.opml"'})
+
+    @app.post("/api/podcast/opml")
+    def api_opml_import():
+        text = _body().get("opml")
+        if not isinstance(text, str) or not text.strip():
+            return _error("opml text is required", 400)
+        if len(text) > 5_000_000:
+            return _error("OPML file is too large", 413)
+        try:
+            added = subscriptions.import_opml(manager, text)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        return jsonify({"added": added, "follows": subscriptions.follows(manager)})
+
+    # ----- library ---------------------------------------------------------------
+
+    @app.get("/api/library")
+    def api_library():
+        a = request.args
+        sort = a.get("sort") if a.get("sort") in catalog.SORTS else "recent"
+        return jsonify(catalog.list_library(
+            manager.download_dir, manager.library, query=a.get("q", ""),
+            source=a.get("source") if a.get("source") in catalog.SOURCES else "",
+            sort=sort, offset=_int_arg(a, "offset", 0, lo=0),
+            limit=_int_arg(a, "limit", 60, lo=1, hi=500)))
+
+    @app.route("/api/library/file", methods=["GET", "HEAD"])
+    def api_library_file():
+        try:
+            path = catalog.resolve_rel(manager.download_dir, request.args.get("path", ""))
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        except FileNotFoundError:
+            return _error("file not found", 404)
+        # conditional=True → Range requests, so players can seek.
+        return send_file(path, conditional=True, max_age=0)
+
+    @app.post("/api/library/delete")
+    def api_library_delete():
+        try:
+            result = catalog.delete(manager.download_dir, _body().get("path") or "", manager.library)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        except FileNotFoundError:
+            return _error("file not found", 404)
+        except OSError as exc:
+            return _error(f"could not delete: {exc}", 500)
+        manager.library_changed()
+        return jsonify({"ok": True, **result})
+
+    @app.get("/api/library/shows")
+    def api_library_shows():
+        shows = feeds.archived_shows(manager.download_dir, manager.library)
+        for s in shows:
+            s["feed_url"] = f"{request.host_url}feeds/{s['slug']}.xml"
+        return jsonify({"shows": shows})
+
+    @app.get("/feeds/<path:name>.xml")
+    def podcast_feed(name):
+        if "/" in name or name.startswith("."):
+            return _error("not found", 404)
+        xml = feeds.podcast_rss(manager.download_dir, name, manager.library, request.host_url)
+        if xml is None:
+            return _error("no archived episodes for that show", 404)
+        return Response(xml, mimetype="application/rss+xml")
 
     # ----- queue -----------------------------------------------------------------
 
@@ -319,6 +453,9 @@ def create_app(manager: QueueManager,
             "sponsorblock": [{"id": k, "label": v} for k, v in config.SPONSORBLOCK_LABELS.items()],
             "sort_orders": list(config.SORT_ORDERS),
             "indeterminate_phases": sorted(progress.INDETERMINATE_PHASES),
+            "music_formats": [{"id": k, "label": f["label"], "hint": f["hint"]}
+                              for k, f in config.MUSIC_FORMATS.items()],
+            "podcast_sync_choices": list(config.PODCAST_SYNC_CHOICES),
             "qualities": [
                 {"id": k, "label": p["label"], "hint": p["hint"],
                  "audio_only": bool(p.get("audio_only"))}

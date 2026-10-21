@@ -16,16 +16,26 @@ two downloads, and per-stream progress would run 0→100% twice. A `before_dl`
 step records the planned streams so each hook call can be folded into one
 overall figure.
 
+After the move, a final step (ChiveFinishPP) applies Chive's own tags and
+cover art and — for music albums — splits the file into one tagged track per
+chapter (see chive/tagging.py). The tags arrive as `--chive-tags <json>`,
+which is removed from argv before yt-dlp parses it.
+
 Lines emitted (each flushed, newline-terminated):
   [YTPROG] downloaded|total|estimate|speed|eta|status|ext
   [YTPP]   <postprocessor name>          (a postprocessing phase started)
+  [YTFILE] {"path": …, "title": …}       (a finished file; one per album track)
+  [chive]  <message>                     (a note for the item log)
 
-Run by path (not as a package module), so it imports nothing from `chive`.
+Run by path (not as a package module); it adds the repository root to
+sys.path to import chive.tagging.
 """
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 from typing import Any
 
 _SUBTITLE_EXTS = {"vtt", "srt", "ass", "ssa", "ttml", "srv1", "srv2", "srv3", "json3", "lrc"}
@@ -78,11 +88,70 @@ def progress_fields(d: dict[str, Any], plan: dict[str, Any]) -> tuple | None:
     return (done, overall, None, speed, eta, status, ext)
 
 
+def pop_chive_tags(argv: list[str]) -> tuple[list[str], dict[str, Any] | None]:
+    """Remove `--chive-tags <json>` from argv; return (argv, tags)."""
+    if "--chive-tags" not in argv:
+        return argv, None
+    i = argv.index("--chive-tags")
+    raw = argv[i + 1] if i + 1 < len(argv) else "{}"
+    try:
+        tags = json.loads(raw)
+    except json.JSONDecodeError:
+        tags = None
+    return argv[:i] + argv[i + 2:], tags if isinstance(tags, dict) else None
+
+
+def finish(info: dict[str, Any], tags: dict[str, Any] | None, ffmpeg: str | None) -> list[dict[str, Any]]:
+    """Tag (and, for albums, split) the downloaded file; return the finished
+    files as [{path, title, track?, duration}]."""
+    from chive import tagging
+
+    path = Path(info.get("filepath") or "")
+    single = [{"path": str(path), "title": info.get("title"), "duration": info.get("duration")}]
+    if not tags or not path.is_file():
+        return single
+    if not ffmpeg:
+        _emit("[chive] ffmpeg not found — skipping tags and track splitting")
+        return single
+
+    cover_dest = (Path(tags["cover_save"]) if tags.get("cover_save")
+                  else path.with_name(f".{path.stem}.cover.jpg"))
+    cover = tagging.prepare_cover(ffmpeg, tags.get("cover_url") or info.get("thumbnail"),
+                                  cover_dest, square=bool(tags.get("square")))
+    control = ("mode", "cover_url", "cover_save", "square", "keep_full")
+    base = {k: v for k, v in tags.items() if k not in control}
+    try:
+        spans = tagging.chapter_spans(info.get("chapters") or [], info.get("duration"))
+        if tags.get("mode") == "album" and len(spans) >= 2:
+            _emit("[YTPP] ChiveSplit")
+            files = tagging.split_album(
+                ffmpeg, path, spans, base, cover, path.parent,
+                on_track=lambda n, total, title: _emit(f"[chive] track {n:02d}/{total:02d}: {title}"))
+            if not tags.get("keep_full"):
+                path.unlink(missing_ok=True)
+            return files
+        if tags.get("mode") == "album":
+            _emit("[chive] no chapters found — keeping the album as a single track")
+        base.setdefault("title", info.get("title"))
+        tagging.tag_file(ffmpeg, path, base, cover)
+        return [{"path": str(path), "title": base.get("title"), "track": base.get("track"),
+                 "duration": info.get("duration")}]
+    except (OSError, RuntimeError) as exc:
+        _emit(f"[chive] tagging failed ({exc}) — the file is kept untagged")
+        return single
+    finally:
+        if cover and not tags.get("cover_save"):
+            cover.unlink(missing_ok=True)
+
+
 def main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # for chive.tagging
     import yt_dlp
     from yt_dlp.postprocessor.common import PostProcessor
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
-    parsed = yt_dlp.parse_options(sys.argv[1:])
+    argv, chive_tags = pop_chive_tags(sys.argv[1:])
+    parsed = yt_dlp.parse_options(argv)
     opts = dict(parsed.ydl_opts)
     # The progress hook below is our single source of progress; suppress
     # yt-dlp's own progress line so it doesn't also spam the captured log.
@@ -114,8 +183,21 @@ def main() -> int:
     opts.setdefault("progress_hooks", []).append(progress_hook)
     opts.setdefault("postprocessor_hooks", []).append(postprocessor_hook)
 
+    class ChiveFinishPP(PostProcessor):
+        """Last step: Chive's tags/cover/album split, then report the files."""
+
+        def run(self, info):
+            ffmpeg = FFmpegPostProcessor(self._downloader)
+            for f in finish(info, chive_tags, ffmpeg.executable if ffmpeg.available else None):
+                _emit("[YTFILE] " + json.dumps(f, ensure_ascii=False))
+            return [], info
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.add_post_processor(ChivePlanPP(), when="before_dl")
+        ydl.add_post_processor(ChiveFinishPP(), when="after_move")
+        info_file = getattr(parsed.options, "load_info_filename", None)
+        if not parsed.urls and info_file:
+            return int(ydl.download_with_info_file(info_file) or 0)
         return int(ydl.download(parsed.urls) or 0)
 
 

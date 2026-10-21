@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import http.server
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -115,3 +117,35 @@ class MediaServer:
         self.httpd.shutdown()
         self.httpd.server_close()
 
+
+
+HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def make_audio(path: Path, seconds: int = 30, ext: str = "mp3") -> Path:
+    """A real (sine-wave) audio file, made with ffmpeg."""
+    codec = {"mp3": ["-c:a", "libmp3lame", "-b:a", "64k"], "m4a": ["-c:a", "aac", "-b:a", "64k"]}[ext]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", f"sine=frequency=440:duration={seconds}", *codec, str(path)], check=True)
+    return path
+
+
+def make_image(path: Path, size: str = "640x360") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=1",
+                    "-frames:v", "1", str(path)], check=True)
+    return path
+
+
+def probe(path) -> dict:
+    """ffprobe: {"tags": {...lowercased}, "streams": [(type, codec, attached_pic)], "duration": s}."""
+    import json
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                          "format=duration:format_tags:stream=codec_type,codec_name:stream_disposition=attached_pic",
+                          "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+    d = json.loads(out)
+    return {"tags": {k.lower(): v for k, v in d["format"].get("tags", {}).items()},
+            "duration": float(d["format"]["duration"]),
+            "streams": [(st["codec_type"], st["codec_name"], st.get("disposition", {}).get("attached_pic"))
+                        for st in d["streams"]]}

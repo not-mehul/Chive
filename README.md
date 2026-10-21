@@ -6,10 +6,11 @@
 ![version](https://img.shields.io/badge/version-1.0.0-84c95c)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-A local web app for archiving **YouTube channels and podcasts** — with
-SponsorBlock segments cut out automatically. Everything runs on your machine;
-there's no telemetry. Downloads and scraping go through the local bridge; the
-browser itself only loads thumbnails/artwork and Google Fonts.
+A local web app for archiving **YouTube, podcasts, music and almost any video
+site** — with SponsorBlock segments cut out, albums split into properly tagged
+tracks, and a built-in library to browse and play it all. Everything runs on
+your machine: no telemetry, no third-party fonts or scripts. The browser only
+talks to Chive (plus thumbnail/artwork images from the sites you archive).
 
 Built as a three-tier system:
 
@@ -26,17 +27,30 @@ Everything routes through `http://127.0.0.1:8765`.
   thumbnail to queue; filter & sort the whole channel; SponsorBlock remove/mark;
   subtitles; quality presets; already-downloaded videos are grayed out.
 - **Podcasts** — search shows, browse episodes, queue one or the whole feed.
-- **Queue** — parallel downloads, live progress/speed/ETA, aggregate stats,
-  pause/resume/cancel/retry, per-item logs, reveal-in-folder.
-- **Design** — an editorial Dusk/Dawn theme, keyboard-accessible, a few easter
-  eggs.
+  Episodes get real tags (show, host, date, artwork). **Follow** shows to keep
+  them archived (auto-check every few hours, or on demand), **import/export
+  OPML**, and subscribe to your archive as **local RSS feeds** from any podcast
+  app.
+- **Music** — paste a YouTube Music / Bandcamp / SoundCloud album or playlist,
+  or search for an album. Full-album uploads are **split into one track per
+  chapter**, each tagged with title, track n/N, album, artist and year, with
+  square cover art — in `Music/<Artist>/<Album>/`.
+- **Any site** — anything yt-dlp supports (Vimeo, Twitch VODs, news sites…),
+  single videos or playlists, saved under `Web/<site>/`.
+- **Library** — browse everything you've archived, search it, filter by
+  source, play it in the browser (seekable), save a copy, or delete it.
+- **Queue** — parallel downloads, live progress/speed/ETA (also in the tab
+  title), aggregate stats, pause/resume/cancel/retry, live per-item logs,
+  reveal-in-folder, and optional **desktop notifications**.
+- **Design** — an editorial Dusk/Dawn theme, keyboard-accessible (press `/`
+  to search), respects reduced motion, a few easter eggs.
 
 ## Requirements
 
 | Tool       | Why it's needed                              |
 | ---------- | -------------------------------------------- |
 | `yt-dlp`   | scraping, downloading, SponsorBlock lookup   |
-| `ffmpeg`   | muxing video/audio, cutting sponsor segments |
+| `ffmpeg`   | muxing, cutting sponsor segments, tagging, splitting albums |
 | `python3`  | runs the bridge server                       |
 
 Install them via your package manager:
@@ -126,6 +140,33 @@ $env:CHIVE_PORT="9000"; python server.py
    follows a running download live and is kept across restarts;
    failed items can be diagnosed without re-running in a terminal.
 
+### Music
+
+Switch to **Music** and paste an album or playlist link, or type an album
+name to search YouTube for full-album uploads. Playlists are queued as
+individual tracks with their album position; a single full-album video is
+downloaded once and **split by its chapters** into `NN - Title` tracks. Every
+track is tagged (title, track n/N, album, artist, album artist, year) and gets
+the album art — cropped square — embedded and saved as `cover.jpg`. Track
+titles are cleaned of numbering and noise like "(Official Audio)". Choose MP3
+or M4A in Settings; tick *Keep the full album file* to keep the unsplit file
+too. (Splitting and tagging need `ffmpeg`.)
+
+### Any site
+
+**Any site** takes a link to anything yt-dlp supports — one video or a whole
+playlist — and downloads it with your quality preset into
+`Web/<site>/<uploader>/`.
+
+### Library
+
+The **Library** tab lists every media file in your download folder — with the
+metadata Chive recorded when it finished (title, show/album, artist, track),
+or described from file and folder names for anything older or added by hand.
+Search, filter by source, sort, play in the browser (with seeking), save a
+copy, or delete. Deleting also removes subtitles/thumbnails next to the file
+and its entry in the download archive, so it can be downloaded again.
+
 ### Podcasts
 
 Flip the **YouTube / Podcasts** toggle in the Source header to archive audio
@@ -136,6 +177,26 @@ the show's RSS audio enclosures, downloaded as-is by yt-dlp's generic extractor
 into `…/<Podcast>/<Episode> [<tag>].<ext>` (the tag comes from the episode's
 feed id, so same-titled episodes such as "Trailer" never collide), reusing the whole queue/progress/stats
 machinery. Already-downloaded episodes are grayed out, just like videos.
+
+- **Tags** — each episode is tagged from the feed: title, show (album),
+  host (artist), release date, genre *Podcast*, and the artwork.
+- **Follow** a show (button above the episode grid) to keep it archived:
+  *Check for new* queues every episode published since you followed it that
+  isn't already downloaded. Set *Settings → Podcasts · auto-check* to do that
+  every 1–24 hours (the queue starts by itself when something new turns up).
+- **OPML** — import your subscriptions from another podcast app, or export
+  the shows you follow.
+- **Local feeds** — every archived show gets an RSS feed at
+  `http://127.0.0.1:8765/feeds/<Show>.xml` (listed under Library → Podcasts).
+  Subscribe from a podcast app on this computer to play your archive. To use
+  it from a phone, run Chive on your LAN (`CHIVE_HOST=0.0.0.0` plus
+  `CHIVE_ALLOWED_HOSTS=<this computer's name or IP>`) — see *Security*.
+
+### Notifications
+
+Turn on *Settings → Desktop notifications* to hear about finished and failed
+downloads, a drained queue, and newly found podcast episodes while Chive is in
+a background tab. The choice is stored in this browser only.
 
 > **Beyond YouTube.** This started as a YouTube channel archiver and is becoming
 > a broader archival tool — YouTube and podcasts today, more sources to come.
@@ -232,7 +293,13 @@ do that on a network you trust.
 │   ├── ytdlp_runner.py     #   flushing API wrapper (run as a subprocess)
 │   ├── youtube.py          #   scraping, search, filter & sort
 │   ├── podcasts.py         #   podcast search & RSS feeds
-│   ├── library.py          #   what's already on disk
+│   ├── music.py            #   album/track lookup & metadata
+│   ├── web.py              #   any-site lookup
+│   ├── tagging.py          #   tags, cover art, chapter-based album splitting
+│   ├── library.py          #   file naming & already-downloaded detection
+│   ├── catalog.py          #   the Library: index, listing, safe access, delete
+│   ├── feeds.py            #   local podcast RSS feeds & OPML
+│   ├── subscriptions.py    #   followed podcasts & auto-sync
 │   ├── api.py              #   Flask app, request guard, SSE
 │   └── util.py             #   formatting, disk, process helpers
 ├── static/
@@ -242,7 +309,10 @@ do that on a network you trust.
 │       ├── app.js          #   state, rendering, bindings
 │       ├── queue-model.js  #   pure queue/event logic
 │       ├── format.js       #   pure formatting
+│       ├── library.js      #   the Library view & player
+│       ├── notifications.js#   desktop notifications, tab-title progress
 │       └── …               #   api, dom, modal, log viewer, easter eggs
+│   └── fonts/              # self-hosted fonts (OFL)
 └── tests/                  # Python, JS and browser tests
 ```
 
