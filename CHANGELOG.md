@@ -3,7 +3,7 @@
 All notable changes to Chive are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] — 2026-10-22
 
 ### Added
 - **Library view** — browse everything archived (indexed metadata merged with

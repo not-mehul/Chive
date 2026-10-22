@@ -3,7 +3,7 @@
 **ar·chive** — snip the fluff, keep the good stuff.
 
 ![CI](https://github.com/not-mehul/ytarchive/actions/workflows/ci.yml/badge.svg)
-![version](https://img.shields.io/badge/version-1.0.0-84c95c)
+![version](https://img.shields.io/badge/version-1.1.0-84c95c)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 A local web app for archiving **YouTube, podcasts, music and almost any video
