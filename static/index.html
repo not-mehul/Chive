@@ -21,9 +21,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" />
+  <link rel="stylesheet" href="/static/fonts/fonts.css" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -62,13 +60,37 @@
           </button>
         </div>
       </div>
+      <nav class="view-tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" id="tab-archive" data-view="archive" aria-selected="true" aria-controls="view-archive" class="active">Archive</button>
+        <button type="button" role="tab" id="tab-library" data-view="library" aria-selected="false" aria-controls="view-library" tabindex="-1">Library <span class="tab-count mono" id="library-count"></span></button>
+      </nav>
       <div class="disk-banner" id="disk-banner" hidden></div>
     </header>
+
+    <div id="view-archive" role="tabpanel" aria-labelledby="tab-archive">
 
     <section class="section" aria-labelledby="src-title">
       <div class="section-head">
         <span class="marker">Source.</span>
         <h2 id="src-title" class="section-title">Channel or playlist</h2>
+        <div class="mode-seg" role="radiogroup" aria-label="What to archive" id="mode-seg">
+          <button type="button" role="radio" data-mode="youtube" class="active" aria-checked="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="m10 9 5 3-5 3z" fill="currentColor" stroke="none"/></svg>
+            YouTube
+          </button>
+          <button type="button" role="radio" data-mode="podcast" aria-checked="false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+            Podcasts
+          </button>
+          <button type="button" role="radio" data-mode="music" aria-checked="false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            Music
+          </button>
+          <button type="button" role="radio" data-mode="web" aria-checked="false">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+            Any site
+          </button>
+        </div>
       </div>
       <form id="scrape-form" class="source-row" autocomplete="off">
         <input
@@ -86,7 +108,18 @@
         </button>
       </form>
       <div class="channel-results" id="channel-results" hidden></div>
-      <div class="source-options">
+      <div class="follow-strip podcast-only" id="follow-strip">
+        <div class="follow-head">
+          <span class="label">Following</span>
+          <span class="follow-actions">
+            <button type="button" class="btn btn-ghost btn-mini" id="sync-all" title="Queue new episodes of every followed show">Check for new</button>
+            <label class="btn btn-ghost btn-mini file-btn" title="Follow every show in an OPML file">Import OPML<input type="file" id="opml-file" accept=".opml,.xml,text/xml,text/x-opml" hidden /></label>
+            <a class="btn btn-ghost btn-mini" id="opml-export" href="/api/podcast/opml" download="chive-podcasts.opml">Export OPML</a>
+          </span>
+        </div>
+        <div class="follow-list" id="follow-list"></div>
+      </div>
+      <div class="source-options youtube-only">
         <label class="check" for="ignore-shorts">
           <input type="checkbox" id="ignore-shorts" checked />
           <span class="box">
@@ -125,6 +158,8 @@
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg>
         </button>
         <span class="spacer"></span>
+        <button class="btn btn-ghost btn-compact podcast-only" id="follow-btn" type="button" aria-pressed="false"
+          title="Follow: queue new episodes automatically when you check for new ones">Follow</button>
         <button class="btn btn-ghost btn-compact" id="select-page" type="button" title="Queue every video on this page">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
           Queue all
@@ -147,7 +182,7 @@
             placeholder="Search titles across the whole channel…"
           />
         </div>
-        <label class="sort-control">
+        <label class="sort-control youtube-only">
           <span class="sort-label">Sort</span>
           <select id="sort-select" aria-label="Sort order">
             <option value="newest">Newest</option>
@@ -158,13 +193,13 @@
             <option value="least_viewed">Least viewed</option>
           </select>
         </label>
-        <button type="button" class="btn btn-ghost" id="toggle-filters">
+        <button type="button" class="btn btn-ghost youtube-only" id="toggle-filters" aria-expanded="false" aria-controls="advanced-filters">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M7 12h10M10 18h4"></path></svg>
           Filters
         </button>
         <span class="filter-count mono" id="filter-count"></span>
       </div>
-      <div class="advanced-filters" id="advanced-filters" hidden>
+      <div class="advanced-filters youtube-only" id="advanced-filters" hidden>
         <div class="filter-grid">
           <div class="filter-field">
             <span class="label">Duration · seconds</span>
@@ -244,19 +279,60 @@
       </div>
     </section>
 
+    </div><!-- /view-archive -->
+
+    <div id="view-library" role="tabpanel" aria-labelledby="tab-library" hidden>
+      <section class="section library-section" aria-labelledby="lib-title">
+        <div class="section-head">
+          <span class="marker">Library.</span>
+          <h2 id="lib-title" class="section-title"><span id="lib-total">0</span> <span class="muted-inline" id="lib-meta">files</span></h2>
+          <span class="lib-size mono" id="lib-size"></span>
+        </div>
+        <div class="lib-toolbar">
+          <div class="filter-search">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3-3"></path></svg>
+            <input id="lib-search" type="search" spellcheck="false" placeholder="Search your library — titles, shows, albums, artists…" aria-label="Search library" />
+          </div>
+          <label class="sort-control">
+            <span class="sort-label">Sort</span>
+            <select id="lib-sort" aria-label="Sort library">
+              <option value="recent">Recently added</option>
+              <option value="title">Title</option>
+              <option value="collection">Album / show</option>
+              <option value="size">Largest</option>
+            </select>
+          </label>
+        </div>
+        <div class="lib-sources" id="lib-sources" role="radiogroup" aria-label="Filter by source"></div>
+        <div class="lib-feeds" id="lib-feeds" hidden>
+          <p class="hint"><em>Podcast feeds.</em> Subscribe to these in any podcast app on this computer to play your archive.</p>
+          <div class="lib-feed-list" id="lib-feed-list"></div>
+        </div>
+        <div class="lib-grid" id="lib-grid"></div>
+        <p class="muted lib-empty" id="lib-empty" hidden></p>
+        <div class="lib-more"><button type="button" class="btn btn-ghost" id="lib-more" hidden>Load more</button></div>
+      </section>
+    </div><!-- /view-library -->
+
     <footer class="footer">
       <p>
-        <em>Privacy.</em> No telemetry. The only remote calls are to
-        YouTube and SponsorBlock. <em>Engine.</em> yt-dlp fetches;
-        ffmpeg muxes and trims. <em>Reach.</em> The bridge binds to
+        <em>Privacy.</em> No telemetry, no third-party fonts or scripts. Remote
+        calls go only to the sites you archive from (and their thumbnails), the
+        Apple podcast directory, and SponsorBlock. <em>Engine.</em> yt-dlp
+        fetches; ffmpeg muxes and trims. <em>Reach.</em> The bridge binds to
         <span class="mono">127.0.0.1</span>.
+      </p>
+      <p class="footer-meta">
+        <span class="brand-mini">Chive</span>
+        <span class="mono" id="app-version">v1.1.0</span>
+        · ar·chive everything, snip the fluff.
       </p>
     </footer>
   </main>
 
   <!-- ===== Settings modal ===== -->
   <div class="modal-overlay" id="settings-modal" hidden>
-    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
       <div class="modal-head">
         <h3 id="settings-title">Settings</h3>
         <button type="button" class="modal-close" id="settings-close" aria-label="Close settings">
@@ -397,6 +473,43 @@
         </div>
 
         <div class="settings-group">
+          <h4 class="settings-group-title">Music, podcasts &amp; alerts</h4>
+          <div class="config-grid">
+            <div class="panel">
+              <p class="label">Music · format</p>
+              <div class="seg" role="radiogroup" aria-label="Music format" id="music-format-seg"></div>
+              <p class="hint" id="music-format-hint"></p>
+              <label class="check" for="music-keep-full">
+                <input type="checkbox" id="music-keep-full" />
+                <span class="box"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg></span>
+                Keep the full album file too
+              </label>
+              <p class="hint">
+                <em>Albums.</em> A full-album upload with chapters is split into
+                one track per chapter, each tagged with title, track number,
+                album, artist and year, with square cover art.
+              </p>
+            </div>
+            <div class="panel">
+              <p class="label">Podcasts · auto-check</p>
+              <div class="field-row">
+                <label for="sync-hours" class="field-label">Check followed shows</label>
+                <select id="sync-hours"></select>
+              </div>
+              <p class="label">Desktop notifications</p>
+              <label class="check" for="notify-toggle">
+                <input type="checkbox" id="notify-toggle" />
+                <span class="box"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg></span>
+                Notify me when downloads finish or fail
+              </label>
+              <p class="hint" id="notify-hint">
+                Shown while Chive is in a background tab. Stays on this browser.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group">
           <h4 class="settings-group-title">Destination</h4>
           <div class="panel">
             <div class="dest-row">
@@ -433,20 +546,34 @@
 
   <!-- ===== Log modal ===== -->
   <div class="modal-overlay" id="log-modal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="log-modal-title">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="log-modal-title" tabindex="-1">
       <div class="modal-head">
         <h3 id="log-modal-title">Log</h3>
         <div class="modal-head-actions">
+          <span class="log-live" id="log-modal-live" hidden title="Updating as the download runs"><span class="log-live-dot"></span>live</span>
           <button type="button" class="btn btn-ghost btn-mini" id="log-modal-save">Download .log</button>
           <button type="button" class="modal-close" id="log-modal-close" aria-label="Close">
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
           </button>
         </div>
       </div>
-      <pre class="modal-log mono" id="log-modal-body"></pre>
+      <pre class="modal-log mono" id="log-modal-body" tabindex="0" aria-live="off"></pre>
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <!-- ===== Player modal ===== -->
+  <div class="modal-overlay" id="player-modal" hidden>
+    <div class="modal player-modal" role="dialog" aria-modal="true" aria-labelledby="player-title" tabindex="-1">
+      <div class="modal-head">
+        <h3 id="player-title">Playing</h3>
+        <button type="button" class="modal-close" id="player-close" aria-label="Close player">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="player-body" id="player-body"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/js/app.js"></script>
 </body>
 </html>

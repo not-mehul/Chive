@@ -1,0 +1,28 @@
+[project]
+name = "chive"
+dynamic = ["version"]
+description = "Archive YouTube channels and podcasts locally — snip the fluff, keep the good stuff."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "Flask>=3.0.0",
+    "yt-dlp>=2024.1.0",
+    "waitress>=3.0.0",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["node_modules"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, bugbear, import order, pyupgrade, simplify.
+select = ["E", "F", "W", "B", "I", "UP", "SIM"]
+ignore = [
+    "SIM105",  # try/except/pass reads clearer than contextlib.suppress here
+    "SIM108",  # ternaries aren't always clearer than if/else
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E731", "SIM117", "E501"]  # long assertions read better unwrapped
